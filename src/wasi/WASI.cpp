@@ -308,6 +308,15 @@ void WASI::fd_renumber(ExecutionState& state, Value* argv, Value* result, Instan
     result[0] = Value(uvwasi_fd_renumber(WASI::g_uvwasi, from, to));
 }
 
+void WASI::fd_filestat_set_times(ExecutionState& state, Value* argv, Value* result, Instance* instance)
+{
+    uint32_t fd = argv[0].asI32();
+    uint64_t st_atim = argv[1].asI64();
+    uint64_t st_mtim = argv[2].asI64();
+    uint32_t fst_flags = argv[3].asI32();
+
+    result[0] = Value(uvwasi_fd_filestat_set_times(WASI::g_uvwasi, fd, st_atim, st_mtim, fst_flags));
+}
 void WASI::fd_fdstat_get(ExecutionState& state, Value* argv, Value* result, Instance* instance)
 {
     uint32_t fd = argv[0].asI32();
