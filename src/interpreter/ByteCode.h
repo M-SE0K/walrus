@@ -464,7 +464,7 @@ class FunctionType;
     F(F64Abs, floatAbs, double)         \
     F(F64Neg, floatNeg, double)
 
-#define FOR_EACH_BYTECODE_UNARY_OP_2_BASE(F)                            \
+#define FOR_EACH_BYTECODE_UNARY_OP_2(F)                                 \
     F(I64Extend8S, intExtend, uint64_t, uint64_t, uint64_t, 7)          \
     F(I64Extend16S, intExtend, uint64_t, uint64_t, uint64_t, 15)        \
     F(I64Extend32S, intExtend, uint64_t, uint64_t, uint64_t, 31)        \
@@ -496,15 +496,10 @@ class FunctionType;
     F(I64TruncSatF64S, intTruncSat, double, int64_t, int64_t, double)   \
     F(I64TruncSatF64U, intTruncSat, double, uint64_t, uint64_t, double) \
     F(F64PromoteF32, doConvert, float, double, double, float)           \
-    F(F32DemoteF64, doConvert, double, float, float, double)
-
-#define FOR_EACH_BYTECODE_UNARY_OP_2_REVERSED(F)                    \
-    F(I64ExtendI32S, doConvert, int32_t, int64_t, int64_t, int32_t) \
+    F(F32DemoteF64, doConvert, double, float, float, double)            \
+    F(I64ExtendI32S, doConvert, int32_t, int64_t, int64_t, int32_t)     \
     F(I64ExtendI32U, doConvert, uint32_t, uint64_t, uint64_t, uint32_t)
 
-#define FOR_EACH_BYTECODE_UNARY_OP_2(F)  \
-    FOR_EACH_BYTECODE_UNARY_OP_2_BASE(F) \
-    FOR_EACH_BYTECODE_UNARY_OP_2_REVERSED(F)
 
 #define FOR_EACH_BYTECODE_LOAD_INT_OP(F) \
     F(I32Load, int32_t, int32_t)         \
@@ -1811,24 +1806,8 @@ public:
 #endif
 };
 
-class UnaryReversedOperation : public ByteCodeOffset2 {
-public:
-    UnaryReversedOperation(Opcode code, ByteCodeStackOffset srcOffset, ByteCodeStackOffset dstOffset)
-        : ByteCodeOffset2(code, dstOffset, srcOffset)
-    {
-    }
-
-    ByteCodeStackOffset srcOffset() const { return stackOffset2(); }
-    ByteCodeStackOffset dstOffset() const { return stackOffset1(); }
-
 #if !defined(NDEBUG)
-    void dump(size_t pos)
-    {
-    }
-#endif
-};
 
-#if !defined(NDEBUG)
 #define DEFINE_UNARY_BYTECODE_DUMP(name)                                                               \
     void dump(size_t pos)                                                                              \
     {                                                                                                  \
@@ -1846,16 +1825,6 @@ public:
         {                                                                  \
         }                                                                  \
         DEFINE_UNARY_BYTECODE_DUMP(name)                                   \
-    };
-
-#define DEFINE_UNARY_REVERSED_BYTECODE(name, ...)                                \
-    class name : public UnaryReversedOperation {                                 \
-    public:                                                                      \
-        name(ByteCodeStackOffset srcOffset, ByteCodeStackOffset dstOffset)       \
-            : UnaryReversedOperation(Opcode::name##Opcode, srcOffset, dstOffset) \
-        {                                                                        \
-        }                                                                        \
-        DEFINE_UNARY_BYTECODE_DUMP(name)                                         \
     };
 
 // dummy ByteCode for ternary operation
@@ -1896,8 +1865,7 @@ public:
 
 FOR_EACH_BYTECODE_BINARY_OP(DEFINE_BINARY_BYTECODE)
 FOR_EACH_BYTECODE_UNARY_OP(DEFINE_UNARY_BYTECODE)
-FOR_EACH_BYTECODE_UNARY_OP_2_BASE(DEFINE_UNARY_BYTECODE)
-FOR_EACH_BYTECODE_UNARY_OP_2_REVERSED(DEFINE_UNARY_REVERSED_BYTECODE)
+FOR_EACH_BYTECODE_UNARY_OP_2(DEFINE_UNARY_BYTECODE)
 FOR_EACH_BYTECODE_SIMD_BINARY_OP(DEFINE_BINARY_BYTECODE)
 FOR_EACH_BYTECODE_SIMD_BINARY_SHIFT_OP(DEFINE_BINARY_BYTECODE)
 FOR_EACH_BYTECODE_SIMD_BINARY_OTHER(DEFINE_BINARY_BYTECODE)
@@ -1932,8 +1900,8 @@ class MoveFloat : public ByteCode {
 public:
     MoveFloat(Opcode code, ByteCodeStackOffset srcOffset, ByteCodeStackOffset dstOffset)
         : ByteCode(code)
-        , m_dstOffset(dstOffset)
         , m_srcOffset(srcOffset)
+        , m_dstOffset(dstOffset)
     {
     }
 
@@ -1941,10 +1909,8 @@ public:
     ByteCodeStackOffset dstOffset() const { return m_dstOffset; }
 
 protected:
-    // The field list is intentionally reserved, to avoid
-    // merging the integer and float code paths in the interpreter.
-    ByteCodeStackOffset m_dstOffset;
     ByteCodeStackOffset m_srcOffset;
+    ByteCodeStackOffset m_dstOffset;
 };
 
 #if !defined(NDEBUG)
@@ -2854,12 +2820,12 @@ DEFINE_MEMORY_LOAD(MemoryLoadM64, ByteCodeOffset2Value64, uint64_t);
     class className : public parentClassName {                                                                 \
     public:                                                                                                    \
         className(Opcode code, valueType offset, ByteCodeStackOffset srcOffset, ByteCodeStackOffset dstOffset) \
-            : parentClassName(code, dstOffset, srcOffset, offset)                                              \
+            : parentClassName(code, srcOffset, dstOffset, offset)                                              \
         {                                                                                                      \
         }                                                                                                      \
         valueType offset() const { return uintValue(); }                                                       \
-        ByteCodeStackOffset srcOffset() const { return stackOffset2(); }                                       \
-        ByteCodeStackOffset dstOffset() const { return stackOffset1(); }                                       \
+        ByteCodeStackOffset srcOffset() const { return stackOffset1(); }                                       \
+        ByteCodeStackOffset dstOffset() const { return stackOffset2(); }                                       \
         IF_DEBUG_ENABLED(                                                                                      \
             void dump(size_t pos){});                                                                          \
     };
@@ -2889,12 +2855,12 @@ DEFINE_MEMORY_LOAD_MEM_IDX(MemoryLoadMemIdxM64, ByteCodeOffset2Value64MemIdx, ui
     class className : public parentClassName {                                                                                                     \
     public:                                                                                                                                        \
         className(uint32_t index, uint32_t alignment, Opcode code, valueType offset, ByteCodeStackOffset srcOffset, ByteCodeStackOffset dstOffset) \
-            : parentClassName(index, alignment, code, dstOffset, srcOffset, offset)                                                                \
+            : parentClassName(index, alignment, code, srcOffset, dstOffset, offset)                                                                \
         {                                                                                                                                          \
         }                                                                                                                                          \
         valueType offset() const { return uintValue(); }                                                                                           \
-        ByteCodeStackOffset srcOffset() const { return stackOffset2(); }                                                                           \
-        ByteCodeStackOffset dstOffset() const { return stackOffset1(); }                                                                           \
+        ByteCodeStackOffset srcOffset() const { return stackOffset1(); }                                                                           \
+        ByteCodeStackOffset dstOffset() const { return stackOffset2(); }                                                                           \
         IF_DEBUG_ENABLED(                                                                                                                          \
             void dump(size_t pos){});                                                                                                              \
     };
@@ -3197,12 +3163,12 @@ DEFINE_MEMORY_STORE(MemoryStore32M64, ByteCodeOffset2Value64, uint64_t);
     class className : public parentClassName {                                                         \
     public:                                                                                            \
         className(Opcode opcode, valueType offset, ByteCodeStackOffset src0, ByteCodeStackOffset src1) \
-            : parentClassName(opcode, src1, src0, offset)                                              \
+            : parentClassName(opcode, src0, src1, offset)                                              \
         {                                                                                              \
         }                                                                                              \
         valueType offset() const { return uintValue(); }                                               \
-        ByteCodeStackOffset dstOffset() const { return stackOffset2(); }                               \
-        ByteCodeStackOffset valueOffset() const { return stackOffset1(); }                             \
+        ByteCodeStackOffset dstOffset() const { return stackOffset1(); }                               \
+        ByteCodeStackOffset valueOffset() const { return stackOffset2(); }                             \
         IF_DEBUG_ENABLED(                                                                              \
             void dump(size_t pos){});                                                                  \
     };
@@ -3232,12 +3198,12 @@ DEFINE_MEMORY_STORE_MEM_IDX(MemoryStoreMemIdx32M64, ByteCodeOffset2Value64MemIdx
     class className : public parentClassName {                                                                                                \
     public:                                                                                                                                   \
         className(uint32_t memIndex, uint32_t alignment, Opcode opcode, valueType offset, ByteCodeStackOffset src0, ByteCodeStackOffset src1) \
-            : parentClassName(memIndex, alignment, opcode, src1, src0, offset)                                                                \
+            : parentClassName(memIndex, alignment, opcode, src0, src1, offset)                                                                \
         {                                                                                                                                     \
         }                                                                                                                                     \
         valueType offset() const { return uintValue(); }                                                                                      \
-        ByteCodeStackOffset dstOffset() const { return stackOffset2(); }                                                                      \
-        ByteCodeStackOffset valueOffset() const { return stackOffset1(); }                                                                    \
+        ByteCodeStackOffset dstOffset() const { return stackOffset1(); }                                                                      \
+        ByteCodeStackOffset valueOffset() const { return stackOffset2(); }                                                                    \
         IF_DEBUG_ENABLED(                                                                                                                     \
             void dump(size_t pos){});                                                                                                         \
     };
