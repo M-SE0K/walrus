@@ -21,6 +21,7 @@
 #include "runtime/Tag.h"
 #include "runtime/Trap.h"
 #include "parser/WASMParser.h"
+#include "parser/ProtectedModule.h"
 #include "parser/WASMComponentParser.h"
 
 #include "wabt/wast-lexer.h"
@@ -42,6 +43,8 @@ struct spectestseps : std::numpunct<char> {
 struct ParseOptions {
     std::string exportToRun;
     std::vector<std::string> fileNames;
+    std::vector<uint32_t> protectionTargets;
+    std::string protectionOutput;
 
     // WASI options
 #ifdef ENABLE_WASI
@@ -1179,12 +1182,12 @@ static void executeWAST(Store* store, const std::string& filename, const std::ve
     }
 }
 
-static void runExports(Store* store, const std::string& filename, const std::vector<uint8_t>& src, std::string& exportToRun)
+static bool runExports(Store* store, const std::string& filename, const std::vector<uint8_t>& src, std::string& exportToRun)
 {
-    auto parseResult = WASMParser::parseBinary(store, filename, src.data(), src.size(), s_JITFlags);
+    auto parseResult = WASMParser::parseBinary(store, filename, src.data(), src.size(), s_JITFlags, s_FeatureFlags);
     if (!parseResult.second.empty()) {
         fprintf(stderr, "parse error: %s\n", parseResult.second.c_str());
-        return;
+        return false;
     }
 
     auto module = parseResult.first;
@@ -1208,11 +1211,11 @@ static void runExports(Store* store, const std::string& filename, const std::vec
             }
         } else {
             fprintf(stderr, "error: module has imports, but imports are not supported\n");
-            return;
+            return false;
         }
 #else
         fprintf(stderr, "error: module has imports, but imports are not supported\n");
-        return;
+        return false;
 #endif
     }
 
@@ -1220,10 +1223,11 @@ static void runExports(Store* store, const std::string& filename, const std::vec
         Module* module;
         ExternVector& importValues;
         std::string* exportToRun;
-    } data = { module.value(), importValues, &exportToRun };
+        bool ran;
+    } data = { module.value(), importValues, &exportToRun, false };
     Walrus::Trap trap;
 
-    trap.run([](ExecutionState& state, void* d) {
+    auto trapResult = trap.run([](ExecutionState& state, void* d) {
         auto data = reinterpret_cast<RunData*>(d);
         Instance* instance = data->module->instantiate(state, data->importValues);
 
@@ -1237,13 +1241,13 @@ static void runExports(Store* store, const std::string& filename, const std::vec
                 FunctionType* fnType = fn->asDefinedFunction()->moduleFunction()->functionType();
 
                 if (fnType->param().size() != 0) {
-                    printf("warning: function %s has params, but params are not supported\n", exp->name().c_str());
-                    return;
+                    Trap::throwException("--run-export requires a function without parameters");
                 }
 
                 Walrus::ValueVector result;
                 result.resize(fnType->result().size());
                 fn->call(state, nullptr, result.data());
+                data->ran = true;
 
                 for (auto&& r : result) {
                     switch (r.type()) {
@@ -1272,6 +1276,15 @@ static void runExports(Store* store, const std::string& filename, const std::vec
         }
     },
              &data);
+    if (trapResult.exception) {
+        fprintf(stderr, "Uncaught Exception: %s\n", trapResult.exception->message().data());
+        return false;
+    }
+    if (!data.ran) {
+        fprintf(stderr, "error: function export not found: %s\n", exportToRun.c_str());
+        return false;
+    }
+    return true;
 }
 
 static void parseArguments(int argc, const char* argv[], ParseOptions& options)
@@ -1279,7 +1292,30 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
     for (int i = 1; i < argc; i++) {
         if (strlen(argv[i]) >= 2 && argv[i][0] == '-') { // parse command line option
             if (argv[i][1] == '-') { // `--option` case
-                if (strcmp(argv[i], "--run-export") == 0) {
+                if (strcmp(argv[i], "--protect-function") == 0) {
+                    if (i + 1 == argc || !argv[i + 1][0]) {
+                        fprintf(stderr, "error: --protect-function requires a decimal function index\n");
+                        exit(1);
+                    }
+                    const char* value = argv[++i];
+                    uint64_t index = 0;
+                    for (const char* digit = value; *digit; digit++) {
+                        if (*digit < '0' || *digit > '9' || index > (UINT32_MAX - static_cast<uint32_t>(*digit - '0')) / 10) {
+                            fprintf(stderr, "error: invalid function index: %s\n", value);
+                            exit(1);
+                        }
+                        index = index * 10 + (*digit - '0');
+                    }
+                    options.protectionTargets.push_back(index);
+                    continue;
+                } else if (strcmp(argv[i], "--output") == 0) {
+                    if (i + 1 == argc || argv[i + 1][0] == '-') {
+                        fprintf(stderr, "error: --output requires a filename\n");
+                        exit(1);
+                    }
+                    options.protectionOutput = argv[++i];
+                    continue;
+                } else if (strcmp(argv[i], "--run-export") == 0) {
                     if (i + 1 == argc || argv[i + 1][0] == '-') {
                         fprintf(stderr, "error: --run-export requires an argument\n");
                         exit(1);
@@ -1340,6 +1376,8 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
                     fprintf(stdout, "Usage: walrus [OPTIONS] <INPUT>\n\n");
                     fprintf(stdout, "OPTIONS:\n");
                     fprintf(stdout, "\t--help\n\t\tShow this message then exit.\n\n");
+                    fprintf(stdout, "\t--run-export <NAME>\n\t\tCall a function export without parameters.\n\n");
+                    fprintf(stdout, "\t--protect-function <INDEX> --output <FILE>\n\t\tCreate G1 protected Wasm; repeat --protect-function for multiple targets. Output must be a new file.\n\n");
                     fprintf(stdout, "\t--enable-web-assembly3\n\t\tEnable support for web assembly3 features.\n\n");
 #if defined(WALRUS_ENABLE_JIT)
                     fprintf(stdout, "\t--jit\n\t\tEnable just-in-time interpretation.\n\n");
@@ -1368,6 +1406,13 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
     if (options.fileNames.empty()) {
         fprintf(stderr, "error: no input files\n");
         exit(1);
+    }
+    if (!options.protectionTargets.empty() || !options.protectionOutput.empty()) {
+        if (options.protectionTargets.empty() || options.protectionOutput.empty() || options.fileNames.size() != 1
+            || !endsWith(options.fileNames[0], ".wasm") || !options.exportToRun.empty() || s_JITFlags) {
+            fprintf(stderr, "error: protection requires one .wasm input, --protect-function and --output, without --run-export or JIT options\n");
+            exit(1);
+        }
     }
 }
 
@@ -1446,8 +1491,39 @@ int main(int argc, const char* argv[])
                 fclose(fp);
             }
             if (endsWith(filePath, "wasm")) {
-                if (!options.exportToRun.empty()) {
-                    runExports(store, filePath, buf, options.exportToRun);
+                if (!options.protectionTargets.empty()) {
+                    auto parsed = WASMParser::parseBinary(store, filePath, buf.data(), buf.size(), 0, s_FeatureFlags);
+                    if (!parsed.second.empty()) {
+                        fprintf(stderr, "parse error: %s\n", parsed.second.c_str());
+                        result = 1;
+                        break;
+                    }
+                    std::vector<uint8_t> protectedWasm;
+                    auto error = packProtectedModule(parsed.first.value(), buf.data(), buf.size(), options.protectionTargets, protectedWasm);
+                    if (!error.empty()) {
+                        fprintf(stderr, "%s\n", error.c_str());
+                        result = 1;
+                        break;
+                    }
+                    FILE* output = fopen(options.protectionOutput.c_str(), "wbx");
+                    if (!output) {
+                        fprintf(stderr, "error: cannot create output %s (it must not exist)\n", options.protectionOutput.c_str());
+                        result = 1;
+                        break;
+                    }
+                    const size_t written = fwrite(protectedWasm.data(), 1, protectedWasm.size(), output);
+                    const int closeResult = fclose(output);
+                    if (written != protectedWasm.size() || closeResult) {
+                        fprintf(stderr, "error: failed to write protected output\n");
+                        result = 1;
+                        break;
+                    }
+                    printf("G1: protected %zu function(s); wrote %zu bytes to %s\n", options.protectionTargets.size(), protectedWasm.size(), options.protectionOutput.c_str());
+                } else if (!options.exportToRun.empty()) {
+                    if (!runExports(store, filePath, buf, options.exportToRun)) {
+                        result = 1;
+                        break;
+                    }
                 } else if (wabt::ReadBinaryIsComponent(buf.data(), buf.size())) {
                     auto trapResult = executeWASMComponent(store, filePath, buf);
                     if (trapResult.exception) {

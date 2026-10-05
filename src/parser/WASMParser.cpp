@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "Walrus.h"
+#include "parser/ProtectedModule.h"
 
 #include "parser/WASMParser.h"
 #include "interpreter/ByteCode.h"
@@ -4094,6 +4095,14 @@ std::pair<Optional<Module*>, std::string> WASMParser::parseBinary(Store* store, 
     }
 
     if (error.length()) {
+        if (delegate.parsingResult().m_typesAddedToStore) {
+            store->getTypeStore().releaseTypes(delegate.parsingResult().m_compositeTypes);
+        }
+        return std::make_pair(nullptr, error);
+    }
+
+    error = loadProtectedFunctions(delegate.parsingResult(), data, len, JITFlags & JITFlagValue::useJIT);
+    if (!error.empty()) {
         if (delegate.parsingResult().m_typesAddedToStore) {
             store->getTypeStore().releaseTypes(delegate.parsingResult().m_compositeTypes);
         }

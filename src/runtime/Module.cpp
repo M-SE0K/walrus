@@ -27,6 +27,7 @@
 #include "runtime/JITExec.h"
 #include "interpreter/ByteCode.h"
 #include "interpreter/Interpreter.h"
+#include "interpreter/ProtectedByteCode.h"
 #include "parser/WASMParser.h"
 #include "wasi/WASI.h"
 
@@ -74,6 +75,13 @@ ModuleFunction::~ModuleFunction()
         delete m_jitFunction;
     }
 #endif
+}
+
+void ModuleFunction::setProtectedFunction(std::unique_ptr<ProtectedFunction> function)
+{
+    ASSERT(!m_protectedFunction);
+    m_requiredStackSize = function->frameSize;
+    m_protectedFunction = std::move(function);
 }
 
 Module::~Module()

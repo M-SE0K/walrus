@@ -107,6 +107,11 @@ private:
         auto moduleFunction = function->moduleFunction();
         ALLOCA(uint8_t, functionStackBase, moduleFunction->requiredStackSize());
 
+        if (moduleFunction->protectedFunction()) {
+            // Version 1 defines all frame bytes as zero before copying arguments.
+            memset(functionStackBase, 0, moduleFunction->requiredStackSize());
+        }
+
         for (size_t i = 0; i < parameterOffsetCount; i++) {
             ((size_t*)functionStackBase)[i] = *((size_t*)(bp + offsets[i]));
         }
@@ -114,6 +119,12 @@ private:
         size_t programCounter = reinterpret_cast<size_t>(moduleFunction->byteCode());
         StackFrame frame(functionStackBase, moduleFunction->requiredStackSize());
         ByteCodeStackOffset* resultOffsets;
+        ByteCodeStackOffset protectedResultOffset;
+
+        if (moduleFunction->protectedFunction()) {
+            protectedResultOffset = interpretProtected(newState, *moduleFunction->protectedFunction(), frame);
+            resultOffsets = &protectedResultOffset;
+        } else
 
 #if defined(WALRUS_ENABLE_JIT)
         if (moduleFunction->jitFunction() != nullptr) {
@@ -180,6 +191,9 @@ private:
                                           size_t programCounter,
                                           StackFrame& frame,
                                           Instance* instance);
+
+    static ByteCodeStackOffset interpretProtected(ExecutionState& state,
+                                                  const ProtectedFunction& function, StackFrame& frame);
 
     static void callOperation(ExecutionState& state,
                               size_t& programCounter,

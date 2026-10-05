@@ -19,6 +19,7 @@
 
 #include "runtime/ObjectType.h"
 #include "runtime/Object.h"
+#include <memory>
 
 namespace wabt {
 class WASMBinaryReader;
@@ -30,6 +31,7 @@ namespace Walrus {
 class Store;
 class Module;
 class Instance;
+struct ProtectedFunction;
 class JITFunction;
 class JITModule;
 
@@ -222,6 +224,10 @@ public:
 
     const uint8_t* byteCode() const { return m_byteCode.data(); }
 
+    const ProtectedFunction* protectedFunction() const { return m_protectedFunction.get(); }
+    const ValueTypeVector& locals() const { return m_local; }
+    void setProtectedFunction(std::unique_ptr<ProtectedFunction> function);
+
     size_t byteCodeSize() const
     {
         return m_byteCode.size();
@@ -261,6 +267,7 @@ private:
     FunctionType* m_functionType;
     ValueTypeVector m_local;
     VectorWithFixedSize<uint8_t, std::allocator<uint8_t>> m_byteCode;
+    std::unique_ptr<ProtectedFunction> m_protectedFunction;
 #if !defined(NDEBUG)
     Vector<size_t, std::allocator<size_t>> m_localDebugData;
     Vector<std::pair<Value, size_t>, std::allocator<std::pair<Value, size_t>>> m_constantDebugData;

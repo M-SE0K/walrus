@@ -3236,7 +3236,8 @@ NEVER_INLINE bool Interpreter::tailCallOperation(
     uint16_t parameterOffsetCount,
     uint16_t resultOffsetCount)
 {
-    if (LIKELY(target->kind() == Function::DefinedFunctionKind)) {
+    if (LIKELY(target->kind() == Function::DefinedFunctionKind)
+        && !target->asDefinedFunction()->moduleFunction()->protectedFunction()) {
         DefinedFunction* definedTarget = target->asDefinedFunction();
         ModuleFunction* targetModuleFunction = definedTarget->moduleFunction();
 #if defined(WALRUS_ENABLE_JIT)
