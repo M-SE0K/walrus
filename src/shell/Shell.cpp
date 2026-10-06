@@ -22,6 +22,7 @@
 #include "runtime/Trap.h"
 #include "parser/WASMParser.h"
 #include "parser/ProtectedModule.h"
+#include "interpreter/Interpreter.h"
 #include "parser/WASMComponentParser.h"
 
 #include "wabt/wast-lexer.h"
@@ -47,6 +48,7 @@ struct ParseOptions {
     std::string protectionOutput;
     Walrus::ProtectionOptions protection;
     bool protectionSeedSupplied = false;
+    bool profileProtected = false;
 
     // WASI options
 #ifdef ENABLE_WASI
@@ -1326,6 +1328,26 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
                     }
                     options.protection.version2 = true;
                     continue;
+                } else if (strcmp(argv[i], "--fusion") == 0) {
+                    if (i + 1 == argc || options.protection.version3) {
+                        fprintf(stderr, "error: --fusion requires on or off, once\n");
+                        exit(1);
+                    }
+                    const char* value = argv[++i];
+                    if (strcmp(value, "on") && strcmp(value, "off")) {
+                        fprintf(stderr, "error: --fusion requires on or off\n");
+                        exit(1);
+                    }
+                    options.protection.version3 = true;
+                    options.protection.fusion = !strcmp(value, "on");
+                    continue;
+                } else if (strcmp(argv[i], "--profile-protected") == 0) {
+                    if (options.profileProtected) {
+                        fprintf(stderr, "error: --profile-protected may appear only once\n");
+                        exit(1);
+                    }
+                    options.profileProtected = true;
+                    continue;
                 } else if (strcmp(argv[i], "--seed") == 0) {
                     if (i + 1 == argc || !argv[i + 1][0] || options.protectionSeedSupplied) {
                         fprintf(stderr, "error: --seed requires a decimal uint64, once\n");
@@ -1415,6 +1437,8 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
                     fprintf(stdout, "\t--protect-function <INDEX> --output <FILE>\n\t\tCreate G1 protected Wasm; repeat --protect-function for multiple targets. Output must be a new file.\n\n");
                     fprintf(stdout, "\t--protection-mode <identity|permuted>\n\t\tUse common format v2: identity is G1, permuted is G2. Omit for legacy G1 v1.\n\n");
                     fprintf(stdout, "\t--seed <UINT64>\n\t\tRequired only for permuted mode; reproduces function-specific opcode mappings.\n\n");
+                    fprintf(stdout, "\t--fusion <on|off>\n\t\tUse common format v3; on adds G3 instruction fusion to permuted mode.\n\n");
+                    fprintf(stdout, "\t--profile-protected\n\t\tWith --run-export, report protected dispatch counts to stderr. Use separately from timing.\n\n");
                     fprintf(stdout, "\t--enable-web-assembly3\n\t\tEnable support for web assembly3 features.\n\n");
 #if defined(WALRUS_ENABLE_JIT)
                     fprintf(stdout, "\t--jit\n\t\tEnable just-in-time interpretation.\n\n");
@@ -1445,9 +1469,9 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
         exit(1);
     }
     if (!options.protectionTargets.empty() || !options.protectionOutput.empty()
-        || options.protection.version2 || options.protectionSeedSupplied) {
+        || options.protection.version2 || options.protection.version3 || options.protectionSeedSupplied) {
         if (options.protectionTargets.empty() || options.protectionOutput.empty() || options.fileNames.size() != 1
-            || !endsWith(options.fileNames[0], ".wasm") || !options.exportToRun.empty() || s_JITFlags) {
+            || !endsWith(options.fileNames[0], ".wasm") || !options.exportToRun.empty() || s_JITFlags || options.profileProtected) {
             fprintf(stderr, "error: protection requires one .wasm input, --protect-function and --output, without --run-export or JIT options\n");
             exit(1);
         }
@@ -1455,7 +1479,17 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
             fprintf(stderr, "error: --seed is required exactly when --protection-mode permuted is selected\n");
             exit(1);
         }
+        if (options.protection.fusion && options.protection.mode != Walrus::ProtectionMode::Permuted) {
+            fprintf(stderr, "error: --fusion on requires --protection-mode permuted and --seed\n");
+            exit(1);
+        }
     }
+    if (options.profileProtected && (options.exportToRun.empty() || s_JITFlags || options.fileNames.size() != 1
+                                     || !endsWith(options.fileNames[0], ".wasm"))) {
+        fprintf(stderr, "error: --profile-protected requires one .wasm and --run-export without JIT\n");
+        exit(1);
+    }
+    Interpreter::setProtectedProfiling(options.profileProtected);
 }
 
 int main(int argc, const char* argv[])
@@ -1561,7 +1595,7 @@ int main(int argc, const char* argv[])
                         break;
                     }
                     printf("%s: protected %zu function(s); wrote %zu bytes to %s\n",
-                           options.protection.mode == Walrus::ProtectionMode::Permuted ? "G2" : "G1",
+                           options.protection.fusion ? "G3" : (options.protection.mode == Walrus::ProtectionMode::Permuted ? "G2" : "G1"),
                            options.protectionTargets.size(), protectedWasm.size(), options.protectionOutput.c_str());
                 } else if (!options.exportToRun.empty()) {
                     if (!runExports(store, filePath, buf, options.exportToRun)) {

@@ -12,8 +12,10 @@ struct WASMParsingResult;
 enum class ProtectionMode : uint32_t { Identity = 0, Permuted = 1 };
 struct ProtectionOptions {
     ProtectionMode mode = ProtectionMode::Identity;
-    // Keep the original CLI's byte-for-byte v1 output; explicit modes use v2.
+    // Keep the original CLI's byte-for-byte v1 output; explicit modes default to v2.
     bool version2 = false;
+    bool version3 = false;
+    bool fusion = false;
     uint64_t seed = 0;
 };
 // Input must first pass the ordinary Wasm parser. Function indices include imports.

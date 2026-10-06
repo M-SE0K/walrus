@@ -17,6 +17,8 @@ OPCODE_NAMES = ["Const32", "Const64", "MoveI32", "MoveI64", "Jump",
                 "JumpIfTrue", "JumpIfFalse", "Return", "Unreachable"]
 OPCODE_NAMES += [width + name for width in ("I32", "I64") for name in BINARY_NAMES]
 OPCODE_NAMES += ["I32Eqz", "I64Eqz", "I32WrapI64", "I64ExtendI32U", "I64ExtendI32S"]
+BASE_OPCODE_COUNT = len(OPCODE_NAMES)
+OPCODE_NAMES += ["I32AddMoveI32", "I64ExtendI32UAddI64"]
 
 
 class Reader:
@@ -83,7 +85,7 @@ def read_protection(data):
     if reader.take(4) != b"WGP1":
         raise ValueError("invalid protection magic")
     version, abi = reader.number(4), reader.number(4)
-    if version != (1 if name == LEGACY_NAME else 2):
+    if version not in ((1,) if name == LEGACY_NAME else (2, 3)):
         raise ValueError("unsupported protection format version")
     if abi != 8:
         raise ValueError("incompatible frame ABI")
@@ -91,7 +93,7 @@ def read_protection(data):
     if stored_checksum != checksum:
         raise ValueError("payload/skeleton checksum mismatch")
     mode, algorithm, seed, identity = 0, None, None, None
-    if version == 2:
+    if version >= 2:
         mode, algorithm = reader.number(4), reader.number(4)
         seed, identity = reader.number(8), reader.number(8)
         if mode not in (0, 1):
@@ -100,12 +102,23 @@ def read_protection(data):
             raise ValueError("unsupported permutation algorithm version")
         if mode == 0 and seed:
             raise ValueError("identity mode does not use a seed")
-    if not count or count > reader.remaining() // (24 + 2 * len(OPCODE_NAMES) + INSTRUCTION_SIZE):
+    fusion, fusion_algorithm = False, None
+    if version == 3:
+        enabled, fusion_algorithm = reader.number(4), reader.number(4)
+        if enabled not in (0, 1) or fusion_algorithm != 1 or (enabled and mode != 1):
+            raise ValueError("invalid fusion mode or algorithm version")
+        fusion = bool(enabled)
+    opcode_count = len(OPCODE_NAMES) if version == 3 else BASE_OPCODE_COUNT
+    record_size = 36 if version == 3 else 24
+    if not count or count > reader.remaining() // (record_size + 2 * opcode_count + INSTRUCTION_SIZE):
         raise ValueError("invalid protected function count")
     functions = []
     seen = set()
     for _ in range(count):
         index, frame, params, results, instructions, mapping_count = [reader.number(4) for _ in range(6)]
+        original, fused, skipped = instructions, 0, 0
+        if version == 3:
+            original, fused, skipped = [reader.number(4) for _ in range(3)]
         if index in seen:
             raise ValueError("duplicate protected function index")
         seen.add(index)
@@ -114,7 +127,7 @@ def read_protection(data):
         types = reader.take(params + results)
         if any(value not in (0x7f, 0x7e) for value in types):
             raise ValueError("invalid integer function type")
-        if mapping_count != len(OPCODE_NAMES):
+        if mapping_count != opcode_count:
             raise ValueError("invalid opcode mapping size")
         mapping = [reader.number(2) for _ in range(mapping_count)]
         if sorted(mapping) != list(range(mapping_count)):
@@ -127,20 +140,36 @@ def read_protection(data):
         if not instructions or instructions > reader.remaining() // INSTRUCTION_SIZE:
             raise ValueError("invalid protected instruction count")
         stream = reader.take(instructions * INSTRUCTION_SIZE)
-        for encoded, reserved, *_ in struct.iter_unpack("<HHIIIQ", stream):
+        patterns = {"I32AddMoveI32": 0, "I64ExtendI32UAddI64": 0}
+        for encoded, reserved, source0, source1, destination, immediate in struct.iter_unpack("<HHIIIQ", stream):
             if encoded >= mapping_count or reserved:
                 raise ValueError("invalid protected opcode or reserved field")
+            opcode = mapping[encoded]
+            if opcode >= BASE_OPCODE_COUNT:
+                if not fusion:
+                    raise ValueError("fused opcode requires fusion mode")
+                if immediate >> (32 if opcode == 46 else 33):
+                    raise ValueError("invalid fused immediate")
+                patterns[OPCODE_NAMES[opcode]] += 1
+            if opcode in (4, 5, 6) and immediate >= instructions:
+                raise ValueError("branch target is out of bounds")
+        if fused != sum(patterns.values()) or original != instructions + fused or skipped > original or (not fusion and skipped):
+            raise ValueError("invalid fusion statistics")
         functions.append({
             "index": index, "frame_bytes": frame, "parameter_types": list(types[:params]),
             "result_types": list(types[params:]), "instruction_count": instructions,
             "opcode_map": mapping, "instructions": stream,
+            "original_instruction_count": original, "fused_instruction_count": fused,
+            "skipped_branch_entry_count": skipped, "fusion_patterns": patterns,
+            "instruction_reduction_ratio": (original - instructions) / original,
         })
     if reader.remaining():
         raise ValueError("trailing protected payload data")
     return {
-        "group": "G2" if mode else "G1", "format_version": version, "abi_word_bytes": abi,
+        "group": "G3" if fusion else ("G2" if mode else "G1"), "format_version": version, "abi_word_bytes": abi,
         "protection_mode": "permuted" if mode else "identity", "seed": seed,
         "permutation_algorithm_version": algorithm,
+        "fusion_enabled": fusion, "fusion_algorithm_version": fusion_algorithm,
         "input_identity_fnv64": None if identity is None else f"{identity:016x}",
         "skeleton_checksum": f"{checksum:016x}", "payload_bytes": len(payload),
         "functions": functions,
@@ -163,7 +192,37 @@ def metadata(protection):
     result["functions"] = []
     for function in protection["functions"]:
         item = {key: value for key, value in function.items() if key not in ("instructions", "opcode_map")}
-        item["opcode_map_sha256"] = hashlib.sha256(struct.pack("<46H", *function["opcode_map"])).hexdigest()
+        item["opcode_map_sha256"] = hashlib.sha256(struct.pack(f"<{len(function['opcode_map'])}H", *function["opcode_map"])).hexdigest()
         item["stream_sha256"] = hashlib.sha256(function["instructions"]).hexdigest()
         result["functions"].append(item)
     return result
+
+
+def expand(function):
+    """Undo permutation and fusion, including relocation of expanded branch targets.
+
+    Returns the base stream and its stored-PC provenance; no original IR is needed.
+    """
+    stored = list(struct.iter_unpack("<HHIIIQ", canonicalize(function)))
+    expanded, sources, positions = [], [], []
+    for pc, fields in enumerate(stored):
+        opcode, _, source0, source1, destination, immediate = fields
+        positions.append(len(expanded))
+        if opcode == 46:
+            pair = [(9, 0, source0, source1, destination, 0),
+                    (2, 0, destination, 0, immediate, 0)]
+        elif opcode == 47:
+            temporary = immediate & 0xffffffff
+            left, right = (source1, temporary) if immediate >> 32 else (temporary, source1)
+            pair = [(44, 0, source0, 0, temporary, 0),
+                    (25, 0, left, right, destination, 0)]
+        else:
+            pair = [fields]
+        expanded.extend(pair)
+        sources.extend([pc] * len(pair))
+    output = bytearray()
+    for fields in expanded:
+        if fields[0] in (4, 5, 6):
+            fields = (*fields[:5], positions[fields[5]])
+        output.extend(struct.pack("<HHIIIQ", *fields))
+    return bytes(output), sources

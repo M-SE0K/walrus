@@ -39,6 +39,9 @@ class Table;
 class Global;
 
 class Interpreter {
+public:
+    static void setProtectedProfiling(bool enabled);
+
 private:
     friend class ByteCodeTable;
     friend class DefinedFunction;

@@ -2,6 +2,7 @@
  * Licensed under the Apache License, Version 2.0. */
 #include "Walrus.h"
 #include "parser/ProtectedModule.h"
+#include "parser/ProtectedFusion.h"
 #include "parser/WASMParser.h"
 #include "interpreter/ByteCode.h"
 #include "interpreter/ProtectedByteCode.h"
@@ -231,52 +232,47 @@ void checkFunctionType(ModuleFunction* function)
     require(!function->hasTryCatch(), "exception handlers are not supported in protected functions");
 }
 
-struct Instruction {
-    ProtectedOpcode opcode;
-    uint32_t source0;
-    uint32_t source1;
-    uint32_t destination;
-    uint64_t immediate;
-};
-
 std::unique_ptr<ProtectedFunction> encodeFunction(ModuleFunction* function, uint32_t index,
                                                 uint64_t identity, const ProtectionOptions& options)
 {
     checkFunctionType(function);
     require(!function->protectedFunction(), "input is already protected");
     std::unique_ptr<ProtectedFunction> output(new ProtectedFunction());
+    output->functionIndex = index;
+    output->opcodeCount = options.version3 ? protectedOpcodeCount : protectedBaseOpcodeCount;
+    output->fusionEnabled = options.fusion;
     output->frameSize = std::max<uint16_t>(8, function->requiredStackSize());
     output->resultCount = function->functionType()->result().size();
     output->resultWidth = output->resultCount ? (typeCode(function->functionType()->result().types()[0]) == 0x7f ? 4 : 8) : 0;
     std::array<uint16_t, protectedOpcodeCount> encodeMap;
-    for (size_t i = 0; i < protectedOpcodeCount; i++) {
+    for (size_t i = 0; i < output->opcodeCount; i++) {
         encodeMap[i] = i;
     }
     if (options.mode == ProtectionMode::Permuted) {
         PermutationRandom random(options.seed ^ identity
                                  ^ (static_cast<uint64_t>(index) * UINT64_C(0xd1b54a32d192ed03))
-                                 ^ UINT64_C(0x5747503200000001));
-        for (size_t i = protectedOpcodeCount - 1; i > 0; i--) {
+                                 ^ (options.version3 ? UINT64_C(0x5747503300000001) : UINT64_C(0x5747503200000001)));
+        for (size_t i = output->opcodeCount - 1; i > 0; i--) {
             std::swap(encodeMap[i], encodeMap[random.bounded(i + 1)]);
         }
         bool identityMap = true;
-        for (size_t i = 0; i < protectedOpcodeCount; i++) {
+        for (size_t i = 0; i < output->opcodeCount; i++) {
             identityMap &= encodeMap[i] == i;
         }
         if (identityMap) {
             std::swap(encodeMap[0], encodeMap[1]);
         }
     }
-    for (size_t i = 0; i < protectedOpcodeCount; i++) {
+    for (size_t i = 0; i < output->opcodeCount; i++) {
         output->opcodeMap[encodeMap[i]] = i;
     }
-    std::vector<Instruction> instructions;
+    std::vector<ProtectedInstruction> instructions;
     std::map<size_t, uint32_t> positions;
     std::vector<std::pair<size_t, int64_t>> branches;
     size_t offset = 0;
     while (offset < function->byteCodeSize()) {
         const auto* byteCode = reinterpret_cast<const ByteCode*>(function->byteCode() + offset);
-        Instruction instruction = { ProtectedOpcode::Unreachable, 0, 0, 0, 0 };
+        ProtectedInstruction instruction = { ProtectedOpcode::Unreachable, 0, 0, 0, 0 };
         positions[offset] = instructions.size();
         switch (byteCode->opcode()) {
         case ByteCode::Const32Opcode: {
@@ -359,6 +355,13 @@ std::unique_ptr<ProtectedFunction> encodeFunction(ModuleFunction* function, uint
         instructions[branch.first].immediate = target->second;
     }
     require(!instructions.empty(), "empty protected function");
+    output->originalInstructionCount = instructions.size();
+    if (options.fusion) {
+        auto fused = fuseProtectedInstructions(instructions);
+        output->fusedInstructionCount = fused.fusedCount;
+        output->skippedBranchEntryCount = fused.skippedBranchEntryCount;
+        instructions.swap(fused.instructions);
+    }
     for (const auto& instruction : instructions) {
         number(output->instructions, encodeMap[static_cast<size_t>(instruction.opcode)], 2);
         number(output->instructions, 0, 2);
@@ -374,6 +377,7 @@ void validateInstructions(const ProtectedFunction& function, FunctionType* type)
 {
     const size_t count = function.instructions.size() / protectedInstructionSize;
     require(count, "empty protected instruction stream");
+    uint32_t fusedCount = 0;
     auto slot = [&function](uint32_t offset, size_t width) {
         require(!(offset % width) && width <= function.frameSize && offset <= function.frameSize - width,
                 "frame access is out of bounds or misaligned");
@@ -381,7 +385,7 @@ void validateInstructions(const ProtectedFunction& function, FunctionType* type)
     for (size_t i = 0; i < count; i++) {
         const auto* data = function.instructions.data() + i * protectedInstructionSize;
         const uint64_t encoded = readProtectedNumber(data, 2);
-        require(encoded < protectedOpcodeCount, "unknown protected opcode");
+        require(encoded < function.opcodeCount, "unknown protected opcode");
         require(!readProtectedNumber(data + 2, 2), "nonzero instruction reserved field");
         const auto opcode = static_cast<ProtectedOpcode>(function.opcodeMap[encoded]);
         const uint32_t source0 = readProtectedNumber(data + 4, 4);
@@ -427,6 +431,24 @@ void validateInstructions(const ProtectedFunction& function, FunctionType* type)
         case ProtectedOpcode::Unreachable:
             require(!source0 && !source1 && !destination && !immediate, "invalid unreachable operands");
             break;
+        case ProtectedOpcode::I32AddMoveI32:
+            require(function.fusionEnabled, "fused opcode requires fusion mode");
+            slot(source0, 4);
+            slot(source1, 4);
+            slot(destination, 4);
+            require(immediate <= UINT32_MAX, "invalid fused move immediate");
+            slot(static_cast<uint32_t>(immediate), 4);
+            fusedCount++;
+            break;
+        case ProtectedOpcode::I64ExtendI32UAddI64:
+            require(function.fusionEnabled, "fused opcode requires fusion mode");
+            slot(source0, 4);
+            slot(source1, 8);
+            slot(destination, 8);
+            require(!(immediate >> 33), "invalid fused extend immediate");
+            slot(static_cast<uint32_t>(immediate), 8);
+            fusedCount++;
+            break;
 #define VALIDATE_BINARY(name, inputType, outputType, ...) \
         case ProtectedOpcode::name: \
             slot(source0, sizeof(inputType)); \
@@ -448,6 +470,10 @@ void validateInstructions(const ProtectedFunction& function, FunctionType* type)
             throw std::runtime_error("unknown protected opcode");
         }
     }
+    require(fusedCount == function.fusedInstructionCount, "fused instruction count mismatch");
+    require(static_cast<uint64_t>(function.originalInstructionCount) == count + fusedCount, "original instruction count mismatch");
+    require(function.skippedBranchEntryCount <= function.originalInstructionCount, "invalid skipped fusion count");
+    require(function.fusionEnabled || !function.skippedBranchEntryCount, "fusion-off record has skipped candidates");
     require(function.resultCount == type->result().size(), "return type mismatch");
 }
 } // namespace
@@ -459,7 +485,8 @@ std::string packProtectedModule(Module* module, const uint8_t* data, size_t size
     try {
         require(sizeof(size_t) == 8, "protected modules require a 64-bit Walrus build");
         require(options.mode == ProtectionMode::Identity || options.mode == ProtectionMode::Permuted, "invalid protection mode");
-        require(options.version2 || options.mode == ProtectionMode::Identity, "permutation requires format v2");
+        require(options.version2 || options.version3 || options.mode == ProtectionMode::Identity, "permutation requires format v2 or v3");
+        require(!options.fusion || (options.version3 && options.mode == ProtectionMode::Permuted), "fusion requires format v3 and permuted mode");
         require(options.mode == ProtectionMode::Permuted || !options.seed, "identity mode does not use a seed");
         require(!functions.empty(), "no protection targets supplied");
         const auto inputSections = sections(data, size);
@@ -510,15 +537,19 @@ std::string packProtectedModule(Module* module, const uint8_t* data, size_t size
         }
         std::vector<uint8_t> payload;
         payload.insert(payload.end(), { 'W', 'G', 'P', '1' });
-        number(payload, options.version2 ? 2 : 1, 4);
+        number(payload, options.version3 ? 3 : (options.version2 ? 2 : 1), 4);
         number(payload, 8, 4);
         number(payload, skeletonHash(skeleton.data(), sections(skeleton.data(), skeleton.size())), 8);
         number(payload, protectedFunctions.size(), 4);
-        if (options.version2) {
+        if (options.version2 || options.version3) {
             number(payload, static_cast<uint32_t>(options.mode), 4);
             number(payload, 1, 4); // permutation algorithm version, shared by both modes
             number(payload, options.seed, 8);
             number(payload, identity, 8);
+        }
+        if (options.version3) {
+            number(payload, options.fusion ? 1 : 0, 4);
+            number(payload, 1, 4); // two-instruction fusion algorithm version
         }
         for (const auto& entry : protectedFunctions) {
             auto type = module->function(entry.first)->functionType();
@@ -528,21 +559,26 @@ std::string packProtectedModule(Module* module, const uint8_t* data, size_t size
             number(payload, type->param().size(), 4);
             number(payload, function.resultCount, 4);
             number(payload, function.instructions.size() / protectedInstructionSize, 4);
-            number(payload, protectedOpcodeCount, 4);
+            number(payload, function.opcodeCount, 4);
+            if (options.version3) {
+                number(payload, function.originalInstructionCount, 4);
+                number(payload, function.fusedInstructionCount, 4);
+                number(payload, function.skippedBranchEntryCount, 4);
+            }
             for (auto value : type->param().types()) {
                 number(payload, typeCode(value), 1);
             }
             for (auto value : type->result().types()) {
                 number(payload, typeCode(value), 1);
             }
-            for (auto value : function.opcodeMap) {
-                number(payload, value, 2);
+            for (size_t i = 0; i < function.opcodeCount; i++) {
+                number(payload, function.opcodeMap[i], 2);
             }
             require(function.instructions.size() <= payloadLimit - std::min(payload.size(), payloadLimit), "protected payload is too large");
             payload.insert(payload.end(), function.instructions.begin(), function.instructions.end());
         }
         std::vector<uint8_t> custom;
-        const char* name = options.version2 ? commonSectionName : sectionName;
+        const char* name = options.version2 || options.version3 ? commonSectionName : sectionName;
         const size_t nameSize = strlen(name);
         uleb(custom, nameSize);
         custom.insert(custom.end(), name, name + nameSize);
@@ -551,7 +587,7 @@ std::string packProtectedModule(Module* module, const uint8_t* data, size_t size
         output.swap(skeleton);
         return std::string();
     } catch (const std::runtime_error& error) {
-        return std::string(options.mode == ProtectionMode::Permuted ? "G2: " : "G1: ") + error.what();
+        return std::string(options.fusion ? "G3: " : (options.mode == ProtectionMode::Permuted ? "G2: " : "G1: ")) + error.what();
     }
 }
 
@@ -584,12 +620,12 @@ std::string loadProtectedFunctions(WASMParsingResult& result, const uint8_t* dat
         Reader reader(payload, payloadSize);
         require(reader.number(4) == UINT32_C(0x31504757), "invalid protection magic");
         const auto version = reader.number(4);
-        require(version == (commonFormat ? 2 : 1), "unsupported protection format version");
+        require(commonFormat ? (version == 2 || version == 3) : version == 1, "unsupported protection format version");
         require(reader.number(4) == 8, "incompatible frame ABI");
         require(reader.number(8) == skeletonHash(data, inputSections), "payload/skeleton checksum mismatch");
         const auto count = reader.number(4);
         ProtectionMode mode = ProtectionMode::Identity;
-        if (version == 2) {
+        if (version >= 2) {
             const auto rawMode = reader.number(4);
             require(rawMode <= static_cast<uint32_t>(ProtectionMode::Permuted), "invalid protection mode");
             mode = static_cast<ProtectionMode>(rawMode);
@@ -597,6 +633,14 @@ std::string loadProtectedFunctions(WASMParsingResult& result, const uint8_t* dat
             const auto seed = reader.number(8);
             require(mode == ProtectionMode::Permuted || !seed, "identity mode does not use a seed");
             reader.number(8); // original input identity is reproducibility metadata, not authentication
+        }
+        bool fusion = false;
+        if (version == 3) {
+            const auto enabled = reader.number(4);
+            require(enabled <= 1, "invalid fusion mode");
+            fusion = enabled;
+            require(reader.number(4) == 1, "unsupported fusion algorithm version");
+            require(!fusion || mode == ProtectionMode::Permuted, "fusion requires permuted mode");
         }
         const uint32_t imported = importedFunctions(result.m_imports);
         const auto bodies = codeBodies(inputSections);
@@ -610,6 +654,9 @@ std::string loadProtectedFunctions(WASMParsingResult& result, const uint8_t* dat
             const uint64_t resultCount = reader.number(4);
             const uint64_t instructionCount = reader.number(4);
             const uint64_t mapCount = reader.number(4);
+            const uint64_t originalCount = version == 3 ? reader.number(4) : instructionCount;
+            const uint64_t fusedCount = version == 3 ? reader.number(4) : 0;
+            const uint64_t skippedCount = version == 3 ? reader.number(4) : 0;
             require(index >= imported && index < imported + bodies.size(), "invalid protected function index");
             require(!functions.count(index), "duplicate protected function index");
             const auto& body = bodies[index - imported];
@@ -620,7 +667,7 @@ std::string loadProtectedFunctions(WASMParsingResult& result, const uint8_t* dat
             require(frameSize >= 8 && frameSize <= UINT16_MAX && !(frameSize % 8)
                         && frameSize >= type->paramStackSize() && frameSize >= type->resultStackSize(), "invalid protected frame size");
             require(paramCount == type->param().size() && resultCount == type->result().size(), "protected signature count mismatch");
-            require(mapCount == protectedOpcodeCount, "invalid opcode mapping size");
+            require(mapCount == (version == 3 ? protectedOpcodeCount : protectedBaseOpcodeCount), "invalid opcode mapping size");
             for (auto value : type->param().types()) {
                 require(reader.number(1) == typeCode(value), "protected parameter type mismatch");
             }
@@ -628,14 +675,20 @@ std::string loadProtectedFunctions(WASMParsingResult& result, const uint8_t* dat
                 require(reader.number(1) == typeCode(value), "protected return type mismatch");
             }
             std::unique_ptr<ProtectedFunction> function(new ProtectedFunction());
+            function->functionIndex = index;
+            function->opcodeCount = mapCount;
+            function->fusionEnabled = fusion;
+            function->originalInstructionCount = originalCount;
+            function->fusedInstructionCount = fusedCount;
+            function->skippedBranchEntryCount = skippedCount;
             function->frameSize = frameSize;
             function->resultCount = resultCount;
             function->resultWidth = resultCount ? (typeCode(type->result().types()[0]) == 0x7f ? 4 : 8) : 0;
             std::array<bool, protectedOpcodeCount> seen = {};
             bool identityMap = true;
-            for (size_t j = 0; j < protectedOpcodeCount; j++) {
+            for (size_t j = 0; j < mapCount; j++) {
                 const auto opcode = reader.number(2);
-                require(opcode < protectedOpcodeCount, "opcode mapping is out of range");
+                require(opcode < mapCount, "opcode mapping is out of range");
                 require(!seen[opcode], "duplicate opcode mapping entry");
                 seen[opcode] = true;
                 identityMap &= opcode == j;

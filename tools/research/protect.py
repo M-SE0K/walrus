@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a common-format G1/G2 artifact and a reproducibility manifest."""
+"""Generate a G1/G2/G3 artifact and a reproducibility manifest."""
 
 import argparse
 import hashlib
@@ -24,7 +24,10 @@ def main():
     parser.add_argument("--function", required=True, type=int, action="append")
     parser.add_argument("--mode", required=True, choices=("identity", "permuted"))
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--fusion", choices=("on", "off"), help="select format v3; on requires permuted mode")
     args = parser.parse_args()
+    if args.fusion == "on" and args.mode != "permuted":
+        parser.error("--fusion on requires permuted mode")
     if any(index < 0 or index > 0xffffffff for index in args.function):
         parser.error("function indices must be uint32")
     if len(set(args.function)) != len(args.function):
@@ -49,6 +52,8 @@ def main():
         command = [str(engine), "--protection-mode", args.mode]
         if args.seed is not None:
             command += ["--seed", str(args.seed)]
+        if args.fusion is not None:
+            command += ["--fusion", args.fusion]
         for index in sorted(args.function):
             command += ["--protect-function", str(index)]
         command += ["--output", str(output), str(source)]
@@ -58,6 +63,8 @@ def main():
         protection = read_protection(output.read_bytes())
         if protection is None or protection["protection_mode"] != args.mode:
             raise ValueError("output protection mode mismatch")
+        if protection["fusion_enabled"] != (args.fusion == "on"):
+            raise ValueError("output fusion mode mismatch")
         result = {
             "command": command, "engine": str(engine), "engine_sha256": engine_sha,
             "input": str(source), "input_sha256": input_sha,

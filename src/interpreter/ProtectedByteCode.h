@@ -8,7 +8,8 @@
 #include <cstdint>
 #include <vector>
 
-// This order is part of format version 1, independent of ByteCode::Opcode.
+// The base order is shared by formats v1/v2; v3 appends two fused opcodes.
+// These IDs are independent of ByteCode::Opcode.
 // Arithmetic uses unsigned operands to preserve Wasm's wrapping semantics.
 #define FOR_EACH_PROTECTED_BINARY(F) \
     F(I32Add, uint32_t, uint32_t, a + b) \
@@ -58,6 +59,8 @@ enum class ProtectedOpcode : uint16_t {
     FOR_EACH_PROTECTED_BINARY(DECLARE_PROTECTED_OPCODE)
     FOR_EACH_PROTECTED_UNARY(DECLARE_PROTECTED_OPCODE)
 #undef DECLARE_PROTECTED_OPCODE
+    I32AddMoveI32,
+    I64ExtendI32UAddI64,
     Count
 };
 
@@ -65,6 +68,7 @@ enum class ProtectedOpcode : uint16_t {
 // u16 opcode, u16 reserved, u32 source0, u32 source1, u32 destination, u64 immediate.
 static const size_t protectedInstructionSize = 24;
 static const size_t protectedOpcodeCount = static_cast<size_t>(ProtectedOpcode::Count);
+static const size_t protectedBaseOpcodeCount = 46;
 
 inline uint64_t readProtectedNumber(const uint8_t* data, size_t bytes)
 {
@@ -76,6 +80,12 @@ inline uint64_t readProtectedNumber(const uint8_t* data, size_t bytes)
 }
 
 struct ProtectedFunction {
+    uint32_t functionIndex = 0;
+    uint32_t opcodeCount = protectedBaseOpcodeCount;
+    bool fusionEnabled = false;
+    uint32_t originalInstructionCount = 0;
+    uint32_t fusedInstructionCount = 0;
+    uint32_t skippedBranchEntryCount = 0;
     uint16_t frameSize;
     uint32_t resultCount;
     uint8_t resultWidth;

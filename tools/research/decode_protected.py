@@ -9,7 +9,7 @@ from pathlib import Path
 import struct
 import time
 
-from protected_format import OPCODE_NAMES, canonicalize, metadata, read_protection
+from protected_format import OPCODE_NAMES, canonicalize, expand, metadata, read_protection
 
 
 def recover(data, include_instructions=True):
@@ -23,7 +23,7 @@ def recover(data, include_instructions=True):
     }
     recovered_count = 0
     for function in protection["functions"]:
-        canonical = canonicalize(function)
+        canonical, sources = expand(function)
         instructions, counts = [], Counter()
         for pc, fields in enumerate(struct.iter_unpack("<HHIIIQ", canonical)):
             opcode, _, source0, source1, destination, immediate = fields
@@ -31,19 +31,23 @@ def recover(data, include_instructions=True):
             counts[name] += 1
             if include_instructions:
                 instructions.append({
-                    "pc": pc, "encoded_opcode": struct.unpack_from("<H", function["instructions"], pc * 24)[0],
+                    "pc": pc, "source_stored_pc": sources[pc],
+                    "encoded_opcode": struct.unpack_from("<H", function["instructions"], sources[pc] * 24)[0],
                     "opcode": opcode, "name": name, "source0": source0, "source1": source1,
                     "destination": destination, "immediate": immediate,
                 })
         item = {
-            "index": function["index"], "instruction_count": function["instruction_count"],
+            "index": function["index"], "instruction_count": len(sources),
+            "stored_instruction_count": function["instruction_count"],
+            "fused_instruction_count": function["fused_instruction_count"],
+            "stored_canonical_stream_sha256": hashlib.sha256(canonicalize(function)).hexdigest(),
             "canonical_stream_sha256": hashlib.sha256(canonical).hexdigest(),
             "opcode_counts": dict(sorted(counts.items())),
         }
         if include_instructions:
             item["instructions"] = instructions
         result["functions"].append(item)
-        recovered_count += function["instruction_count"]
+        recovered_count += len(sources)
     result["recovered_instruction_count"] = recovered_count
     # Structural recovery coverage, not a source-code recovery or protection-strength score.
     result["instruction_mapping_coverage"] = 1.0

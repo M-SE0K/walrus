@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""G0/G1/G2 pilot: check outputs and measure end-to-end Walrus process latency.
+"""G0/G1/G2/G3 pilot: check outputs and measure end-to-end Walrus process latency.
 
 Every observation starts a NEW process and includes startup, module loading,
 instantiation, the selected exported function, output capture, and shutdown.
@@ -71,7 +71,7 @@ def cpu_model():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--group", required=True, choices=("G0", "G1", "G2"))
+    parser.add_argument("--group", required=True, choices=("G0", "G1", "G2", "G3"))
     parser.add_argument("--engine", required=True, type=Path)
     parser.add_argument("--wasm", required=True, type=Path)
     parser.add_argument("--export", dest="export_name", choices=EXPECTED, default="sum_10m")
