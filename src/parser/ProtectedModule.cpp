@@ -11,6 +11,7 @@
 namespace Walrus {
 namespace {
 const char sectionName[] = "walrus.protected.g1";
+const char commonSectionName[] = "walrus.protected";
 const uint8_t stubBody[] = { 0, 0, 0x0b }; // no locals; unreachable; end
 const size_t payloadLimit = 64 * 1024 * 1024;
 
@@ -20,6 +21,45 @@ void require(bool condition, const std::string& message)
         throw std::runtime_error(message);
     }
 }
+
+bool isProtectionSection(const std::string& name)
+{
+    return name == sectionName || name == commonSectionName;
+}
+
+uint64_t inputIdentity(const uint8_t* data, size_t size)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < size; i++) {
+        hash = (hash ^ data[i]) * UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+// Algorithm 1: SplitMix64, then descending Fisher-Yates with rejection sampling.
+// Avoid std::shuffle/distributions: their output can differ across standard libraries.
+class PermutationRandom {
+public:
+    explicit PermutationRandom(uint64_t state) : m_state(state) { }
+    uint64_t next()
+    {
+        uint64_t value = (m_state += UINT64_C(0x9e3779b97f4a7c15));
+        value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+        return value ^ (value >> 31);
+    }
+    size_t bounded(uint64_t bound)
+    {
+        const uint64_t threshold = (UINT64_C(0) - bound) % bound;
+        uint64_t value;
+        do {
+            value = next();
+        } while (value < threshold);
+        return value % bound;
+    }
+private:
+    uint64_t m_state;
+};
 
 class Reader {
 public:
@@ -178,7 +218,7 @@ uint8_t typeCode(Value::Type type)
 void checkFunctionType(ModuleFunction* function)
 {
     auto type = function->functionType();
-    require(type->result().size() <= 1, "multiple return values are not supported in G1 v1");
+    require(type->result().size() <= 1, "multiple return values are not supported in protected functions");
     for (auto value : type->param().types()) {
         typeCode(value);
     }
@@ -199,7 +239,8 @@ struct Instruction {
     uint64_t immediate;
 };
 
-std::unique_ptr<ProtectedFunction> encodeFunction(ModuleFunction* function)
+std::unique_ptr<ProtectedFunction> encodeFunction(ModuleFunction* function, uint32_t index,
+                                                uint64_t identity, const ProtectionOptions& options)
 {
     checkFunctionType(function);
     require(!function->protectedFunction(), "input is already protected");
@@ -207,8 +248,27 @@ std::unique_ptr<ProtectedFunction> encodeFunction(ModuleFunction* function)
     output->frameSize = std::max<uint16_t>(8, function->requiredStackSize());
     output->resultCount = function->functionType()->result().size();
     output->resultWidth = output->resultCount ? (typeCode(function->functionType()->result().types()[0]) == 0x7f ? 4 : 8) : 0;
+    std::array<uint16_t, protectedOpcodeCount> encodeMap;
     for (size_t i = 0; i < protectedOpcodeCount; i++) {
-        output->opcodeMap[i] = i;
+        encodeMap[i] = i;
+    }
+    if (options.mode == ProtectionMode::Permuted) {
+        PermutationRandom random(options.seed ^ identity
+                                 ^ (static_cast<uint64_t>(index) * UINT64_C(0xd1b54a32d192ed03))
+                                 ^ UINT64_C(0x5747503200000001));
+        for (size_t i = protectedOpcodeCount - 1; i > 0; i--) {
+            std::swap(encodeMap[i], encodeMap[random.bounded(i + 1)]);
+        }
+        bool identityMap = true;
+        for (size_t i = 0; i < protectedOpcodeCount; i++) {
+            identityMap &= encodeMap[i] == i;
+        }
+        if (identityMap) {
+            std::swap(encodeMap[0], encodeMap[1]);
+        }
+    }
+    for (size_t i = 0; i < protectedOpcodeCount; i++) {
+        output->opcodeMap[encodeMap[i]] = i;
     }
     std::vector<Instruction> instructions;
     std::map<size_t, uint32_t> positions;
@@ -300,7 +360,7 @@ std::unique_ptr<ProtectedFunction> encodeFunction(ModuleFunction* function)
     }
     require(!instructions.empty(), "empty protected function");
     for (const auto& instruction : instructions) {
-        number(output->instructions, static_cast<uint16_t>(instruction.opcode), 2);
+        number(output->instructions, encodeMap[static_cast<size_t>(instruction.opcode)], 2);
         number(output->instructions, 0, 2);
         number(output->instructions, instruction.source0, 4);
         number(output->instructions, instruction.source1, 4);
@@ -393,17 +453,21 @@ void validateInstructions(const ProtectedFunction& function, FunctionType* type)
 } // namespace
 
 std::string packProtectedModule(Module* module, const uint8_t* data, size_t size,
-                                const std::vector<uint32_t>& functions, std::vector<uint8_t>& output)
+                                const std::vector<uint32_t>& functions, const ProtectionOptions& options,
+                                std::vector<uint8_t>& output)
 {
     try {
-        require(sizeof(size_t) == 8, "G1 v1 requires a 64-bit Walrus build");
+        require(sizeof(size_t) == 8, "protected modules require a 64-bit Walrus build");
+        require(options.mode == ProtectionMode::Identity || options.mode == ProtectionMode::Permuted, "invalid protection mode");
+        require(options.version2 || options.mode == ProtectionMode::Identity, "permutation requires format v2");
+        require(options.mode == ProtectionMode::Permuted || !options.seed, "identity mode does not use a seed");
         require(!functions.empty(), "no protection targets supplied");
         const auto inputSections = sections(data, size);
         for (const auto& section : inputSections) {
-            require(section.id != 8, "modules with a start function are not supported in G1 v1");
+            require(section.id != 8, "modules with a start function are not supported in protected format");
             if (!section.id) {
                 Reader reader(section.data, section.size);
-                require(reader.string() != sectionName, "input is already protected");
+                require(!isProtectionSection(reader.string()), "input is already protected");
             }
         }
         const auto bodies = codeBodies(inputSections);
@@ -411,11 +475,12 @@ std::string packProtectedModule(Module* module, const uint8_t* data, size_t size
         // Walrus can append synthetic initializer functions after declared functions.
         require(bodies.size() + imported <= module->numberOfFunctions(), "function/code count mismatch");
         std::map<uint32_t, std::unique_ptr<ProtectedFunction>> protectedFunctions;
+        const uint64_t identity = inputIdentity(data, size);
         for (auto index : functions) {
             require(index >= imported && index < imported + bodies.size(), "protection target is not a defined function");
             require(!protectedFunctions.count(index), "duplicate protection target");
             try {
-                auto function = encodeFunction(module->function(index));
+                auto function = encodeFunction(module->function(index), index, identity, options);
                 validateInstructions(*function, module->function(index)->functionType());
                 protectedFunctions.emplace(index, std::move(function));
             } catch (const std::runtime_error& error) {
@@ -445,10 +510,16 @@ std::string packProtectedModule(Module* module, const uint8_t* data, size_t size
         }
         std::vector<uint8_t> payload;
         payload.insert(payload.end(), { 'W', 'G', 'P', '1' });
-        number(payload, 1, 4);
+        number(payload, options.version2 ? 2 : 1, 4);
         number(payload, 8, 4);
         number(payload, skeletonHash(skeleton.data(), sections(skeleton.data(), skeleton.size())), 8);
         number(payload, protectedFunctions.size(), 4);
+        if (options.version2) {
+            number(payload, static_cast<uint32_t>(options.mode), 4);
+            number(payload, 1, 4); // permutation algorithm version, shared by both modes
+            number(payload, options.seed, 8);
+            number(payload, identity, 8);
+        }
         for (const auto& entry : protectedFunctions) {
             auto type = module->function(entry.first)->functionType();
             const auto& function = *entry.second;
@@ -471,14 +542,16 @@ std::string packProtectedModule(Module* module, const uint8_t* data, size_t size
             payload.insert(payload.end(), function.instructions.begin(), function.instructions.end());
         }
         std::vector<uint8_t> custom;
-        uleb(custom, sizeof(sectionName) - 1);
-        custom.insert(custom.end(), sectionName, sectionName + sizeof(sectionName) - 1);
+        const char* name = options.version2 ? commonSectionName : sectionName;
+        const size_t nameSize = strlen(name);
+        uleb(custom, nameSize);
+        custom.insert(custom.end(), name, name + nameSize);
         custom.insert(custom.end(), payload.begin(), payload.end());
         appendSection(skeleton, 0, custom);
         output.swap(skeleton);
         return std::string();
     } catch (const std::runtime_error& error) {
-        return std::string("G1: ") + error.what();
+        return std::string(options.mode == ProtectionMode::Permuted ? "G2: " : "G1: ") + error.what();
     }
 }
 
@@ -488,29 +561,43 @@ std::string loadProtectedFunctions(WASMParsingResult& result, const uint8_t* dat
         const auto inputSections = sections(data, size);
         const uint8_t* payload = nullptr;
         size_t payloadSize = 0;
+        bool commonFormat = false;
         for (const auto& section : inputSections) {
             if (!section.id) {
                 Reader reader(section.data, section.size);
-                if (reader.string() == sectionName) {
+                const auto name = reader.string();
+                if (isProtectionSection(name)) {
                     require(!payload, "duplicate protection section");
                     payload = reader.current;
                     payloadSize = reader.remaining();
+                    commonFormat = name == commonSectionName;
                 }
             }
         }
         if (!payload) {
             return std::string();
         }
-        require(sizeof(size_t) == 8, "G1 v1 requires a 64-bit Walrus build");
-        require(!useJIT, "G1 v1 requires interpreter execution; disable --jit");
-        require(!result.m_seenStartAttribute, "modules with a start function are not supported in G1 v1");
+        require(sizeof(size_t) == 8, "protected modules require a 64-bit Walrus build");
+        require(!useJIT, "protected modules require interpreter execution; disable --jit");
+        require(!result.m_seenStartAttribute, "modules with a start function are not supported in protected format");
         require(payloadSize <= payloadLimit, "protected payload is too large");
         Reader reader(payload, payloadSize);
         require(reader.number(4) == UINT32_C(0x31504757), "invalid protection magic");
-        require(reader.number(4) == 1, "unsupported protection format version");
+        const auto version = reader.number(4);
+        require(version == (commonFormat ? 2 : 1), "unsupported protection format version");
         require(reader.number(4) == 8, "incompatible frame ABI");
         require(reader.number(8) == skeletonHash(data, inputSections), "payload/skeleton checksum mismatch");
         const auto count = reader.number(4);
+        ProtectionMode mode = ProtectionMode::Identity;
+        if (version == 2) {
+            const auto rawMode = reader.number(4);
+            require(rawMode <= static_cast<uint32_t>(ProtectionMode::Permuted), "invalid protection mode");
+            mode = static_cast<ProtectionMode>(rawMode);
+            require(reader.number(4) == 1, "unsupported permutation algorithm version");
+            const auto seed = reader.number(8);
+            require(mode == ProtectionMode::Permuted || !seed, "identity mode does not use a seed");
+            reader.number(8); // original input identity is reproducibility metadata, not authentication
+        }
         const uint32_t imported = importedFunctions(result.m_imports);
         const auto bodies = codeBodies(inputSections);
         require(count && count <= bodies.size(), "invalid protected function count");
@@ -544,11 +631,18 @@ std::string loadProtectedFunctions(WASMParsingResult& result, const uint8_t* dat
             function->frameSize = frameSize;
             function->resultCount = resultCount;
             function->resultWidth = resultCount ? (typeCode(type->result().types()[0]) == 0x7f ? 4 : 8) : 0;
+            std::array<bool, protectedOpcodeCount> seen = {};
+            bool identityMap = true;
             for (size_t j = 0; j < protectedOpcodeCount; j++) {
                 const auto opcode = reader.number(2);
-                require(opcode == j, "G1 requires an identity opcode mapping");
+                require(opcode < protectedOpcodeCount, "opcode mapping is out of range");
+                require(!seen[opcode], "duplicate opcode mapping entry");
+                seen[opcode] = true;
+                identityMap &= opcode == j;
+                require(mode != ProtectionMode::Identity || opcode == j, "G1 requires an identity opcode mapping");
                 function->opcodeMap[j] = opcode;
             }
+            require(mode != ProtectionMode::Permuted || !identityMap, "permuted mode requires a non-identity opcode mapping");
             require(instructionCount && instructionCount <= reader.remaining() / protectedInstructionSize, "invalid protected instruction count");
             const size_t bytes = instructionCount * protectedInstructionSize;
             function->instructions.assign(reader.current, reader.current + bytes);
@@ -563,7 +657,7 @@ std::string loadProtectedFunctions(WASMParsingResult& result, const uint8_t* dat
         }
         return std::string();
     } catch (const std::runtime_error& error) {
-        return std::string("G1: ") + error.what();
+        return std::string("protected: ") + error.what();
     }
 }
 } // namespace Walrus

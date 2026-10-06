@@ -45,6 +45,8 @@ struct ParseOptions {
     std::vector<std::string> fileNames;
     std::vector<uint32_t> protectionTargets;
     std::string protectionOutput;
+    Walrus::ProtectionOptions protection;
+    bool protectionSeedSupplied = false;
 
     // WASI options
 #ifdef ENABLE_WASI
@@ -1308,6 +1310,39 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
                     }
                     options.protectionTargets.push_back(index);
                     continue;
+                } else if (strcmp(argv[i], "--protection-mode") == 0) {
+                    if (i + 1 == argc || options.protection.version2) {
+                        fprintf(stderr, "error: --protection-mode requires identity or permuted, once\n");
+                        exit(1);
+                    }
+                    const char* mode = argv[++i];
+                    if (!strcmp(mode, "identity")) {
+                        options.protection.mode = Walrus::ProtectionMode::Identity;
+                    } else if (!strcmp(mode, "permuted")) {
+                        options.protection.mode = Walrus::ProtectionMode::Permuted;
+                    } else {
+                        fprintf(stderr, "error: invalid protection mode: %s\n", mode);
+                        exit(1);
+                    }
+                    options.protection.version2 = true;
+                    continue;
+                } else if (strcmp(argv[i], "--seed") == 0) {
+                    if (i + 1 == argc || !argv[i + 1][0] || options.protectionSeedSupplied) {
+                        fprintf(stderr, "error: --seed requires a decimal uint64, once\n");
+                        exit(1);
+                    }
+                    const char* value = argv[++i];
+                    uint64_t seed = 0;
+                    for (const char* digit = value; *digit; digit++) {
+                        if (*digit < '0' || *digit > '9' || seed > (UINT64_MAX - static_cast<uint64_t>(*digit - '0')) / 10) {
+                            fprintf(stderr, "error: invalid seed: %s\n", value);
+                            exit(1);
+                        }
+                        seed = seed * 10 + (*digit - '0');
+                    }
+                    options.protection.seed = seed;
+                    options.protectionSeedSupplied = true;
+                    continue;
                 } else if (strcmp(argv[i], "--output") == 0) {
                     if (i + 1 == argc || argv[i + 1][0] == '-') {
                         fprintf(stderr, "error: --output requires a filename\n");
@@ -1378,6 +1413,8 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
                     fprintf(stdout, "\t--help\n\t\tShow this message then exit.\n\n");
                     fprintf(stdout, "\t--run-export <NAME>\n\t\tCall a function export without parameters.\n\n");
                     fprintf(stdout, "\t--protect-function <INDEX> --output <FILE>\n\t\tCreate G1 protected Wasm; repeat --protect-function for multiple targets. Output must be a new file.\n\n");
+                    fprintf(stdout, "\t--protection-mode <identity|permuted>\n\t\tUse common format v2: identity is G1, permuted is G2. Omit for legacy G1 v1.\n\n");
+                    fprintf(stdout, "\t--seed <UINT64>\n\t\tRequired only for permuted mode; reproduces function-specific opcode mappings.\n\n");
                     fprintf(stdout, "\t--enable-web-assembly3\n\t\tEnable support for web assembly3 features.\n\n");
 #if defined(WALRUS_ENABLE_JIT)
                     fprintf(stdout, "\t--jit\n\t\tEnable just-in-time interpretation.\n\n");
@@ -1407,10 +1444,15 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
         fprintf(stderr, "error: no input files\n");
         exit(1);
     }
-    if (!options.protectionTargets.empty() || !options.protectionOutput.empty()) {
+    if (!options.protectionTargets.empty() || !options.protectionOutput.empty()
+        || options.protection.version2 || options.protectionSeedSupplied) {
         if (options.protectionTargets.empty() || options.protectionOutput.empty() || options.fileNames.size() != 1
             || !endsWith(options.fileNames[0], ".wasm") || !options.exportToRun.empty() || s_JITFlags) {
             fprintf(stderr, "error: protection requires one .wasm input, --protect-function and --output, without --run-export or JIT options\n");
+            exit(1);
+        }
+        if ((options.protection.mode == Walrus::ProtectionMode::Permuted) != options.protectionSeedSupplied) {
+            fprintf(stderr, "error: --seed is required exactly when --protection-mode permuted is selected\n");
             exit(1);
         }
     }
@@ -1499,7 +1541,7 @@ int main(int argc, const char* argv[])
                         break;
                     }
                     std::vector<uint8_t> protectedWasm;
-                    auto error = packProtectedModule(parsed.first.value(), buf.data(), buf.size(), options.protectionTargets, protectedWasm);
+                    auto error = packProtectedModule(parsed.first.value(), buf.data(), buf.size(), options.protectionTargets, options.protection, protectedWasm);
                     if (!error.empty()) {
                         fprintf(stderr, "%s\n", error.c_str());
                         result = 1;
@@ -1518,7 +1560,9 @@ int main(int argc, const char* argv[])
                         result = 1;
                         break;
                     }
-                    printf("G1: protected %zu function(s); wrote %zu bytes to %s\n", options.protectionTargets.size(), protectedWasm.size(), options.protectionOutput.c_str());
+                    printf("%s: protected %zu function(s); wrote %zu bytes to %s\n",
+                           options.protection.mode == Walrus::ProtectionMode::Permuted ? "G2" : "G1",
+                           options.protectionTargets.size(), protectedWasm.size(), options.protectionOutput.c_str());
                 } else if (!options.exportToRun.empty()) {
                     if (!runExports(store, filePath, buf, options.exportToRun)) {
                         result = 1;

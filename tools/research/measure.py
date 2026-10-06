@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""G0/G1 pilot: check outputs and measure end-to-end Walrus process latency.
+"""G0/G1/G2 pilot: check outputs and measure end-to-end Walrus process latency.
 
 Every observation starts a NEW process and includes startup, module loading,
 instantiation, the selected exported function, output capture, and shutdown.
@@ -15,9 +15,10 @@ import os
 from pathlib import Path
 import platform
 import statistics
-import struct
 import subprocess
 import time
+
+from protected_format import metadata, read_protection
 
 
 EXPECTED = {
@@ -30,61 +31,8 @@ EXPECTED = {
 
 
 def protection_metadata(wasm):
-    """Read experiment metadata; runtime validation remains Walrus's job."""
-    data = wasm.read_bytes()
-    if data[:8] != b"\x00asm\x01\x00\x00\x00":
-        raise ValueError("expected a core Wasm module")
-
-    def read_uleb(offset, limit):
-        value = 0
-        for i in range(5):
-            if offset >= limit:
-                raise ValueError("truncated Wasm section")
-            byte = data[offset]
-            offset += 1
-            if i == 4 and byte & 0xf0:
-                raise ValueError("invalid section length")
-            value |= (byte & 127) << (7 * i)
-            if not byte & 128:
-                return value, offset
-        raise ValueError("invalid section length")
-
-    payload = None
-    offset = 8
-    while offset < len(data):
-        kind = data[offset]
-        size, begin = read_uleb(offset + 1, len(data))
-        end = begin + size
-        if end > len(data):
-            raise ValueError("truncated Wasm section")
-        if kind == 0:
-            name_size, name = read_uleb(begin, end)
-            if name + name_size > end:
-                raise ValueError("truncated section name")
-            if data[name:name + name_size] == b"walrus.protected.g1":
-                if payload is not None:
-                    raise ValueError("duplicate G1 section")
-                payload = data[name + name_size:end]
-        offset = end
-    if payload is None:
-        return None
-    if len(payload) < 24 or payload[:4] != b"WGP1":
-        raise ValueError("invalid G1 header")
-    version, abi, checksum, count = struct.unpack_from("<IIQI", payload, 4)
-    offset = 24
-    functions = []
-    for _ in range(count):
-        if offset + 24 > len(payload):
-            raise ValueError("truncated G1 function record")
-        index, frame, params, results, instructions, mapping = struct.unpack_from("<6I", payload, offset)
-        offset += 24 + params + results + 2 * mapping + 24 * instructions
-        if offset > len(payload):
-            raise ValueError("truncated G1 instruction stream")
-        functions.append({"index": index, "frame_bytes": frame, "instruction_count": instructions})
-    if offset != len(payload):
-        raise ValueError("trailing G1 payload bytes")
-    return {"format_version": version, "abi_word_bytes": abi,
-            "skeleton_checksum": f"{checksum:016x}", "functions": functions}
+    """Read metadata outside the timer; runtime operand validation is Walrus's job."""
+    return metadata(read_protection(wasm.read_bytes()))
 
 
 def sha256(path):
@@ -123,7 +71,7 @@ def cpu_model():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--group", required=True, choices=("G0", "G1"))
+    parser.add_argument("--group", required=True, choices=("G0", "G1", "G2"))
     parser.add_argument("--engine", required=True, type=Path)
     parser.add_argument("--wasm", required=True, type=Path)
     parser.add_argument("--export", dest="export_name", choices=EXPECTED, default="sum_10m")
@@ -142,8 +90,9 @@ def main():
         protection = protection_metadata(wasm)
     except ValueError as error:
         parser.error(str(error))
-    if (args.group == "G1") != (protection is not None):
-        parser.error("--group must match whether the module contains a G1 protection section")
+    actual_group = protection["group"] if protection is not None else "G0"
+    if args.group != actual_group:
+        parser.error(f"--group {args.group} does not match module group {actual_group}")
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     out_dir = args.out_dir or Path("artifacts") / f"{args.group}-{stamp}"
