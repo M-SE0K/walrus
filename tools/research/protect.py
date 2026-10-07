@@ -24,7 +24,10 @@ def main():
     parser.add_argument("--function", required=True, type=int, action="append")
     parser.add_argument("--mode", required=True, choices=("identity", "permuted"))
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--fusion", choices=("on", "off"), help="select format v3; on requires permuted mode")
+    parser.add_argument("--fusion", choices=("on", "off"), help="enable/disable fusion; format v3 by default, v4/v5 with the corresponding option")
+    parser.add_argument("--extended", action="store_true", help="use format v4 with integer/memory/global/call support")
+    parser.add_argument("--floating-point", action="store_true", help="use format v5 with v4 operations and scalar f32/f64 support")
+    parser.add_argument("--enable-web-assembly3", action="store_true", help="enable Walrus's extended Wasm features when reading input")
     args = parser.parse_args()
     if args.fusion == "on" and args.mode != "permuted":
         parser.error("--fusion on requires permuted mode")
@@ -50,6 +53,12 @@ def main():
             raise ValueError("output and manifest directories must exist")
         input_sha, engine_sha = sha256(source), sha256(engine)
         command = [str(engine), "--protection-mode", args.mode]
+        if args.enable_web_assembly3:
+            command += ["--enable-web-assembly3"]
+        if args.extended:
+            command += ["--extended"]
+        if args.floating_point:
+            command += ["--floating-point"]
         if args.seed is not None:
             command += ["--seed", str(args.seed)]
         if args.fusion is not None:

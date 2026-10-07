@@ -40,4 +40,18 @@ int main()
     bool rejected = false;
     try { fuseProtectedInstructions(loop); } catch (const std::runtime_error&) { rejected = true; }
     assert(rejected);
+
+    // A br_table entry is also a block entry, including its default target.
+    std::vector<ProtectedInstruction> table = {
+        { O::BrTable, 0, 0, 0, 0 }, { O::I32Add, 0, 8, 16, 0 },
+        { O::MoveI32, 16, 0, 24, 0 }, { O::ReturnMany, 0, 0, 0, 0 }
+    };
+    std::vector<uint32_t> targets = { 2 };
+    auto tableBlocked = fuseProtectedInstructions(table, &targets);
+    assert(tableBlocked.fusedCount == 0 && tableBlocked.skippedBranchEntryCount == 1);
+    assert(targets[0] == 2);
+    targets[0] = 1;
+    auto tableFused = fuseProtectedInstructions(table, &targets);
+    assert(tableFused.fusedCount == 1 && targets[0] == 1);
+    assert(tableFused.instructions.back().opcode == O::ReturnMany);
 }

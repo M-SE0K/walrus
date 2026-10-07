@@ -1328,6 +1328,14 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
                     }
                     options.protection.version2 = true;
                     continue;
+                } else if (strcmp(argv[i], "--extended") == 0) {
+                    if (options.protection.extended) { fprintf(stderr, "error: --extended may appear only once\n"); exit(1); }
+                    options.protection.extended = true;
+                    continue;
+                } else if (strcmp(argv[i], "--floating-point") == 0) {
+                    if (options.protection.floatingPoint) { fprintf(stderr, "error: --floating-point may appear only once\n"); exit(1); }
+                    options.protection.floatingPoint = true;
+                    continue;
                 } else if (strcmp(argv[i], "--fusion") == 0) {
                     if (i + 1 == argc || options.protection.version3) {
                         fprintf(stderr, "error: --fusion requires on or off, once\n");
@@ -1437,7 +1445,9 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
                     fprintf(stdout, "\t--protect-function <INDEX> --output <FILE>\n\t\tCreate G1 protected Wasm; repeat --protect-function for multiple targets. Output must be a new file.\n\n");
                     fprintf(stdout, "\t--protection-mode <identity|permuted>\n\t\tUse common format v2: identity is G1, permuted is G2. Omit for legacy G1 v1.\n\n");
                     fprintf(stdout, "\t--seed <UINT64>\n\t\tRequired only for permuted mode; reproduces function-specific opcode mappings.\n\n");
-                    fprintf(stdout, "\t--fusion <on|off>\n\t\tUse common format v3; on adds G3 instruction fusion to permuted mode.\n\n");
+                    fprintf(stdout, "\t--fusion <on|off>\n\t\tUse format v3 by default; on adds G3 fusion to permuted mode. --extended/--floating-point selects v4/v5.\n\n");
+                    fprintf(stdout, "\t--extended\n\t\tUse format v4 with integer operations, memory32, globals, calls and multiple returns.\n\n");
+                    fprintf(stdout, "\t--floating-point\n\t\tUse format v5, including v4 operations and scalar f32/f64 support.\n\n");
                     fprintf(stdout, "\t--profile-protected\n\t\tWith --run-export, report protected dispatch counts to stderr. Use separately from timing.\n\n");
                     fprintf(stdout, "\t--enable-web-assembly3\n\t\tEnable support for web assembly3 features.\n\n");
 #if defined(WALRUS_ENABLE_JIT)
@@ -1469,7 +1479,7 @@ static void parseArguments(int argc, const char* argv[], ParseOptions& options)
         exit(1);
     }
     if (!options.protectionTargets.empty() || !options.protectionOutput.empty()
-        || options.protection.version2 || options.protection.version3 || options.protectionSeedSupplied) {
+        || options.protection.extended || options.protection.floatingPoint || options.protection.version2 || options.protection.version3 || options.protectionSeedSupplied) {
         if (options.protectionTargets.empty() || options.protectionOutput.empty() || options.fileNames.size() != 1
             || !endsWith(options.fileNames[0], ".wasm") || !options.exportToRun.empty() || s_JITFlags || options.profileProtected) {
             fprintf(stderr, "error: protection requires one .wasm input, --protect-function and --output, without --run-export or JIT options\n");

@@ -9,7 +9,7 @@ from pathlib import Path
 import struct
 import time
 
-from protected_format import OPCODE_NAMES, canonicalize, expand, metadata, read_protection
+from protected_format import OPCODE_NAMES, canonicalize, expand, expand_auxiliary, metadata, read_protection
 
 
 def recover(data, include_instructions=True):
@@ -24,6 +24,8 @@ def recover(data, include_instructions=True):
     recovered_count = 0
     for function in protection["functions"]:
         canonical, sources = expand(function)
+        auxiliary = expand_auxiliary(function, sources)
+        auxiliary_bytes = struct.pack(f"<{len(auxiliary)}I", *auxiliary)
         instructions, counts = [], Counter()
         for pc, fields in enumerate(struct.iter_unpack("<HHIIIQ", canonical)):
             opcode, _, source0, source1, destination, immediate = fields
@@ -42,10 +44,13 @@ def recover(data, include_instructions=True):
             "fused_instruction_count": function["fused_instruction_count"],
             "stored_canonical_stream_sha256": hashlib.sha256(canonicalize(function)).hexdigest(),
             "canonical_stream_sha256": hashlib.sha256(canonical).hexdigest(),
+            "canonical_auxiliary_sha256": hashlib.sha256(auxiliary_bytes).hexdigest(),
+            "canonical_program_sha256": hashlib.sha256(canonical + auxiliary_bytes).hexdigest(),
             "opcode_counts": dict(sorted(counts.items())),
         }
         if include_instructions:
             item["instructions"] = instructions
+            item["auxiliary"] = auxiliary
         result["functions"].append(item)
         recovered_count += len(sources)
     result["recovered_instruction_count"] = recovered_count

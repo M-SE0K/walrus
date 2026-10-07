@@ -16,9 +16,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", required=True, type=Path)
     parser.add_argument("--wasm", required=True, type=Path)
-    parser.add_argument("--export", dest="export_name", choices=EXPECTED, default="sum_1000")
+    parser.add_argument("--export", dest="export_name", default="sum_1000")
+    parser.add_argument("--expected", help="exact output for a custom scalar export")
     parser.add_argument("--output", required=True, type=Path, help="new JSON file")
     args = parser.parse_args()
+    if args.expected is None and args.export_name not in EXPECTED:
+        parser.error("custom exports require --expected")
+    expected = args.expected if args.expected is not None else EXPECTED[args.export_name]
     try:
         if args.output.exists():
             raise ValueError("output must be a new file")
@@ -29,7 +33,7 @@ def main():
             raise ValueError("expected a protected module")
         command = [str(engine), "--profile-protected", "--run-export", args.export_name, str(wasm)]
         completed = subprocess.run(command, capture_output=True, text=True, timeout=60)
-        if completed.returncode or completed.stdout.strip() != EXPECTED[args.export_name]:
+        if completed.returncode or completed.stdout.strip() != expected:
             raise ValueError(f"execution failed or result mismatch: {completed.stderr.strip()}")
         calls = [json.loads(line[len(PREFIX):]) for line in completed.stderr.splitlines() if line.startswith(PREFIX)]
         if not calls:
@@ -44,6 +48,7 @@ def main():
             "engine_sha256": hashlib.sha256(engine.read_bytes()).hexdigest(),
             "wasm_sha256": hashlib.sha256(data).hexdigest(), "export": args.export_name,
             "result": completed.stdout.strip(), "protection": metadata(protection),
+            "expected": expected,
             "calls": calls, "totals": totals,
         }
         with args.output.open("x") as output:

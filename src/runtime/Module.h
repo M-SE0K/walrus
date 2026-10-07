@@ -388,6 +388,8 @@ public:
         return m_compositeTypes[index];
     }
 
+    size_t numberOfCompositeTypes() const { return m_compositeTypes.size(); }
+
     FunctionType* functionType(uint32_t index) const
     {
         ASSERT(index < m_compositeTypes.size());

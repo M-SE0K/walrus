@@ -15,6 +15,8 @@ struct ProtectionOptions {
     // Keep the original CLI's byte-for-byte v1 output; explicit modes default to v2.
     bool version2 = false;
     bool version3 = false;
+    bool extended = false;
+    bool floatingPoint = false;
     bool fusion = false;
     uint64_t seed = 0;
 };

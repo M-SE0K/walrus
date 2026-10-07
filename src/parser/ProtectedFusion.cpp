@@ -36,7 +36,7 @@ bool combine(const ProtectedInstruction& first, const ProtectedInstruction& seco
 }
 } // namespace
 
-ProtectedFusionResult fuseProtectedInstructions(const std::vector<ProtectedInstruction>& input)
+ProtectedFusionResult fuseProtectedInstructions(const std::vector<ProtectedInstruction>& input, std::vector<uint32_t>* auxiliary)
 {
     if (input.empty() || input.size() > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error("invalid fusion input size");
@@ -45,8 +45,18 @@ ProtectedFusionResult fuseProtectedInstructions(const std::vector<ProtectedInstr
     entry[0] = true;
     for (size_t i = 0; i < input.size(); ++i) {
         const auto& instruction = input[i];
-        if (static_cast<size_t>(instruction.opcode) >= protectedBaseOpcodeCount) {
+        if (static_cast<size_t>(instruction.opcode) >= protectedOpcodeCount || isProtectedFused(instruction.opcode)) {
             throw std::runtime_error("fusion requires base opcodes");
+        }
+        if (instruction.opcode == ProtectedOpcode::BrTable) {
+            const uint64_t start = instruction.destination, size = instruction.immediate + 1;
+            if (!auxiliary || instruction.immediate >= UINT32_MAX || start > auxiliary->size() || size > auxiliary->size() - start)
+                throw std::runtime_error("invalid fusion branch table");
+            for (size_t j = 0; j < size; j++) {
+                const auto target = (*auxiliary)[start + j];
+                if (target >= input.size()) throw std::runtime_error("fusion branch table target is out of bounds");
+                entry[target] = true;
+            }
         }
         if (branch(instruction.opcode)) {
             if (instruction.immediate >= input.size()) {
@@ -55,7 +65,8 @@ ProtectedFusionResult fuseProtectedInstructions(const std::vector<ProtectedInstr
             entry[instruction.immediate] = true;
         }
         if ((branch(instruction.opcode) || instruction.opcode == ProtectedOpcode::Return
-             || instruction.opcode == ProtectedOpcode::Unreachable) && i + 1 < input.size()) {
+             || instruction.opcode == ProtectedOpcode::Unreachable || instruction.opcode == ProtectedOpcode::BrTable
+             || instruction.opcode == ProtectedOpcode::ReturnMany) && i + 1 < input.size()) {
             entry[i + 1] = true;
         }
     }
@@ -78,6 +89,12 @@ ProtectedFusionResult fuseProtectedInstructions(const std::vector<ProtectedInstr
     for (auto& instruction : output.instructions) {
         if (branch(instruction.opcode)) {
             instruction.immediate = output.oldToNew[instruction.immediate];
+        }
+        if (instruction.opcode == ProtectedOpcode::BrTable) {
+            for (size_t i = 0; i <= instruction.immediate; i++) {
+                auto& target = (*auxiliary)[instruction.destination + i];
+                target = output.oldToNew[target];
+            }
         }
     }
     return output;

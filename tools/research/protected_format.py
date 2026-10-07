@@ -19,6 +19,29 @@ OPCODE_NAMES += [width + name for width in ("I32", "I64") for name in BINARY_NAM
 OPCODE_NAMES += ["I32Eqz", "I64Eqz", "I32WrapI64", "I64ExtendI32U", "I64ExtendI32S"]
 BASE_OPCODE_COUNT = len(OPCODE_NAMES)
 OPCODE_NAMES += ["I32AddMoveI32", "I64ExtendI32UAddI64"]
+V3_OPCODE_COUNT = len(OPCODE_NAMES)
+OPCODE_NAMES += [width + name for width in ("I32", "I64") for name in
+                 ("DivS", "DivU", "RemS", "RemU", "Shl", "ShrS", "ShrU", "Rotl", "Rotr")]
+OPCODE_NAMES += [width + name for width in ("I32", "I64") for name in ("Clz", "Ctz", "Popcnt")]
+OPCODE_NAMES += ["I32Extend8S", "I32Extend16S", "I64Extend8S", "I64Extend16S", "I64Extend32S"]
+OPCODE_NAMES += ["I32Load", "I32Load8S", "I32Load8U", "I32Load16S", "I32Load16U",
+                 "I64Load", "I64Load8S", "I64Load8U", "I64Load16S", "I64Load16U", "I64Load32S", "I64Load32U"]
+OPCODE_NAMES += ["I32Store", "I32Store8", "I32Store16", "I64Store", "I64Store8", "I64Store16", "I64Store32"]
+OPCODE_NAMES += ["Select32", "Select64", "BrTable", "GlobalGet32", "GlobalGet64", "GlobalSet32", "GlobalSet64",
+                 "MemorySize", "MemoryGrow", "Call", "CallIndirect", "ReturnMany"]
+V4_OPCODE_COUNT = len(OPCODE_NAMES)
+OPCODE_NAMES += [width + name for width in ("F32", "F64") for name in
+                 ("Add", "Sub", "Mul", "Div", "Max", "Min", "Copysign", "Eq", "Ne", "Lt", "Le", "Gt", "Ge")]
+OPCODE_NAMES += [width + name for width in ("F32", "F64") for name in
+                 ("Sqrt", "Ceil", "Floor", "Trunc", "Nearest", "Abs", "Neg")]
+OPCODE_NAMES += [out + "Trunc" + source + sign for out in ("I32", "I64")
+                 for source in ("F32", "F64") for sign in ("S", "U")]
+OPCODE_NAMES += [out + "Convert" + source + sign for out in ("F32", "F64")
+                 for source in ("I32", "I64") for sign in ("S", "U")]
+OPCODE_NAMES += [out + "TruncSat" + source + sign for out in ("I32", "I64")
+                 for source in ("F32", "F64") for sign in ("S", "U")]
+OPCODE_NAMES += ["F64PromoteF32", "F32DemoteF64", "F32Load", "F64Load"]
+OPCODES = {name: index for index, name in enumerate(OPCODE_NAMES)}
 
 
 class Reader:
@@ -85,7 +108,7 @@ def read_protection(data):
     if reader.take(4) != b"WGP1":
         raise ValueError("invalid protection magic")
     version, abi = reader.number(4), reader.number(4)
-    if version not in ((1,) if name == LEGACY_NAME else (2, 3)):
+    if version not in ((1,) if name == LEGACY_NAME else (2, 3, 4, 5)):
         raise ValueError("unsupported protection format version")
     if abi != 8:
         raise ValueError("incompatible frame ABI")
@@ -103,13 +126,13 @@ def read_protection(data):
         if mode == 0 and seed:
             raise ValueError("identity mode does not use a seed")
     fusion, fusion_algorithm = False, None
-    if version == 3:
+    if version >= 3:
         enabled, fusion_algorithm = reader.number(4), reader.number(4)
         if enabled not in (0, 1) or fusion_algorithm != 1 or (enabled and mode != 1):
             raise ValueError("invalid fusion mode or algorithm version")
         fusion = bool(enabled)
-    opcode_count = len(OPCODE_NAMES) if version == 3 else BASE_OPCODE_COUNT
-    record_size = 36 if version == 3 else 24
+    opcode_count = len(OPCODE_NAMES) if version == 5 else (V4_OPCODE_COUNT if version == 4 else (V3_OPCODE_COUNT if version == 3 else BASE_OPCODE_COUNT))
+    record_size = 40 if version >= 4 else (36 if version == 3 else 24)
     if not count or count > reader.remaining() // (record_size + 2 * opcode_count + INSTRUCTION_SIZE):
         raise ValueError("invalid protected function count")
     functions = []
@@ -117,16 +140,17 @@ def read_protection(data):
     for _ in range(count):
         index, frame, params, results, instructions, mapping_count = [reader.number(4) for _ in range(6)]
         original, fused, skipped = instructions, 0, 0
-        if version == 3:
+        if version >= 3:
             original, fused, skipped = [reader.number(4) for _ in range(3)]
+        auxiliary_count = reader.number(4) if version >= 4 else 0
         if index in seen:
             raise ValueError("duplicate protected function index")
         seen.add(index)
-        if frame < 8 or frame > 65535 or frame % 8 or params * 8 > frame or results > 1:
+        if frame < 8 or frame > 65535 or frame % 8 or params * 8 > frame or (version < 4 and results > 1):
             raise ValueError("invalid protected frame or signature")
         types = reader.take(params + results)
-        if any(value not in (0x7f, 0x7e) for value in types):
-            raise ValueError("invalid integer function type")
+        if any(value not in ((0x7f, 0x7e, 0x7d, 0x7c) if version >= 5 else (0x7f, 0x7e)) for value in types):
+            raise ValueError("invalid protected function type")
         if mapping_count != opcode_count:
             raise ValueError("invalid opcode mapping size")
         mapping = [reader.number(2) for _ in range(mapping_count)]
@@ -140,12 +164,15 @@ def read_protection(data):
         if not instructions or instructions > reader.remaining() // INSTRUCTION_SIZE:
             raise ValueError("invalid protected instruction count")
         stream = reader.take(instructions * INSTRUCTION_SIZE)
+        if auxiliary_count > reader.remaining() // 4:
+            raise ValueError("invalid protected auxiliary count")
+        auxiliary = [reader.number(4) for _ in range(auxiliary_count)]
         patterns = {"I32AddMoveI32": 0, "I64ExtendI32UAddI64": 0}
         for encoded, reserved, source0, source1, destination, immediate in struct.iter_unpack("<HHIIIQ", stream):
             if encoded >= mapping_count or reserved:
                 raise ValueError("invalid protected opcode or reserved field")
             opcode = mapping[encoded]
-            if opcode >= BASE_OPCODE_COUNT:
+            if opcode in (46, 47):
                 if not fusion:
                     raise ValueError("fused opcode requires fusion mode")
                 if immediate >> (32 if opcode == 46 else 33):
@@ -153,12 +180,20 @@ def read_protection(data):
                 patterns[OPCODE_NAMES[opcode]] += 1
             if opcode in (4, 5, 6) and immediate >= instructions:
                 raise ValueError("branch target is out of bounds")
+            if opcode == OPCODES["BrTable"]:
+                if immediate >= 0xffffffff or destination > len(auxiliary) or immediate + 1 > len(auxiliary) - destination:
+                    raise ValueError("invalid branch table auxiliary range")
+                if any(target >= instructions for target in auxiliary[destination:destination + immediate + 1]):
+                    raise ValueError("branch table target is out of bounds")
+            if opcode == OPCODES["ReturnMany"] and (immediate > len(auxiliary) or results > len(auxiliary) - immediate):
+                raise ValueError("invalid return auxiliary range")
         if fused != sum(patterns.values()) or original != instructions + fused or skipped > original or (not fusion and skipped):
             raise ValueError("invalid fusion statistics")
         functions.append({
             "index": index, "frame_bytes": frame, "parameter_types": list(types[:params]),
             "result_types": list(types[params:]), "instruction_count": instructions,
             "opcode_map": mapping, "instructions": stream,
+            "auxiliary": auxiliary, "auxiliary_count": auxiliary_count,
             "original_instruction_count": original, "fused_instruction_count": fused,
             "skipped_branch_entry_count": skipped, "fusion_patterns": patterns,
             "instruction_reduction_ratio": (original - instructions) / original,
@@ -191,9 +226,10 @@ def metadata(protection):
     result = {key: value for key, value in protection.items() if key != "functions"}
     result["functions"] = []
     for function in protection["functions"]:
-        item = {key: value for key, value in function.items() if key not in ("instructions", "opcode_map")}
+        item = {key: value for key, value in function.items() if key not in ("instructions", "opcode_map", "auxiliary")}
         item["opcode_map_sha256"] = hashlib.sha256(struct.pack(f"<{len(function['opcode_map'])}H", *function["opcode_map"])).hexdigest()
         item["stream_sha256"] = hashlib.sha256(function["instructions"]).hexdigest()
+        item["auxiliary_sha256"] = hashlib.sha256(struct.pack(f"<{len(function['auxiliary'])}I", *function["auxiliary"])).hexdigest()
         result["functions"].append(item)
     return result
 
@@ -226,3 +262,16 @@ def expand(function):
             fields = (*fields[:5], positions[fields[5]])
         output.extend(struct.pack("<HHIIIQ", *fields))
     return bytes(output), sources
+
+
+def expand_auxiliary(function, sources):
+    """Relocate br_table entries from stored PCs to expanded base PCs."""
+    output = list(function["auxiliary"])
+    positions = {}
+    for expanded_pc, stored_pc in enumerate(sources):
+        positions.setdefault(stored_pc, expanded_pc)
+    for opcode, _, _, _, start, size in struct.iter_unpack("<HHIIIQ", canonicalize(function)):
+        if opcode == OPCODES["BrTable"]:
+            for index in range(start, start + size + 1):
+                output[index] = positions[function["auxiliary"][index]]
+    return output

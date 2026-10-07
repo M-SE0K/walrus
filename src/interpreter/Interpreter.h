@@ -116,17 +116,21 @@ private:
         }
 
         for (size_t i = 0; i < parameterOffsetCount; i++) {
-            ((size_t*)functionStackBase)[i] = *((size_t*)(bp + offsets[i]));
+            memcpy(functionStackBase + i * sizeof(size_t), bp + offsets[i], sizeof(size_t));
         }
 
         size_t programCounter = reinterpret_cast<size_t>(moduleFunction->byteCode());
         StackFrame frame(functionStackBase, moduleFunction->requiredStackSize());
         ByteCodeStackOffset* resultOffsets;
-        ByteCodeStackOffset protectedResultOffset;
 
         if (moduleFunction->protectedFunction()) {
-            protectedResultOffset = interpretProtected(newState, *moduleFunction->protectedFunction(), frame);
-            resultOffsets = &protectedResultOffset;
+            const auto count = moduleFunction->functionType()->resultStackSize() / sizeof(size_t);
+            ALLOCA(uint64_t, protectedResults, std::max<size_t>(1, count));
+            interpretProtected(newState, *moduleFunction->protectedFunction(), frame, reinterpret_cast<uint8_t*>(protectedResults));
+            for (size_t i = 0; i < resultOffsetCount; i++) {
+                memcpy(bp + offsets[parameterOffsetCount + i], protectedResults + i, sizeof(size_t));
+            }
+            return;
         } else
 
 #if defined(WALRUS_ENABLE_JIT)
@@ -196,7 +200,7 @@ private:
                                           Instance* instance);
 
     static ByteCodeStackOffset interpretProtected(ExecutionState& state,
-                                                  const ProtectedFunction& function, StackFrame& frame);
+                                                  const ProtectedFunction& function, StackFrame& frame, uint8_t* results);
 
     static void callOperation(ExecutionState& state,
                               size_t& programCounter,

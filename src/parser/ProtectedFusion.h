@@ -20,7 +20,8 @@ struct ProtectedFusionResult {
     uint32_t skippedBranchEntryCount = 0;
 };
 
-// Input uses canonical base opcodes and instruction-index branch targets.
-ProtectedFusionResult fuseProtectedInstructions(const std::vector<ProtectedInstruction>& input);
+// Input uses canonical non-fused opcodes and instruction-index branch targets.
+// For v4 br_table, auxiliary contains owned target ranges and is relocated in place.
+ProtectedFusionResult fuseProtectedInstructions(const std::vector<ProtectedInstruction>& input, std::vector<uint32_t>* auxiliary = nullptr);
 } // namespace Walrus
 #endif
